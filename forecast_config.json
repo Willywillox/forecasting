@@ -1,0 +1,68 @@
+{
+    "_descrizione": "Configurazione Forecast WFM - Modifica questo file per personalizzare le impostazioni",
+    "_versione_config": "1.1",
+
+    "forecast": {
+        "giorni_forecast": 90,
+        "_giorni_forecast_note": "Orizzonte di previsione in giorni (7=1 settimana, 28=4 settimane, 90=3 mesi)"
+    },
+
+    "modelli": {
+        "abilitati": ["holtwinters", "pattern", "naive", "sarima", "prophet", "tbats", "intraday_dinamico", "ensemble_hybrid"],
+        "_abilitati_note": "Lista dei modelli da eseguire. Rimuovi quelli che non ti servono per velocizzare",
+        "fast_mode": false,
+        "_fast_mode_note": "Se true, esegue solo modelli leggeri e backtest ridotto"
+    },
+
+    "festivita": {
+        "auto_correzione": true,
+        "_auto_correzione_note": "Se true, rileva e corregge automaticamente le festivita italiane nel forecast",
+        "escludi": [],
+        "_escludi_note": "Lista festivita da escludere (es. ['Natale', 'Santo_Stefano'] se cambi policy)"
+    },
+
+    "anomalie": {
+        "pulisci_storico": false,
+        "_pulisci_storico_note": "Se true, pulisce le anomalie dallo storico prima del forecast",
+        "metodo_pulizia": "interpolate",
+        "_metodo_pulizia_note": "Metodo: 'interpolate', 'media_dow', 'escludi', 'cap'",
+        "soglia_std": 2.5,
+        "_soglia_std_note": "Numero di deviazioni standard per identificare anomalie"
+    },
+
+    "regressori_esterni": {
+        "file_eventi": "eventi_esterni.xlsx",
+        "_file_eventi_note": "Nome file Excel con eventi esterni (campagne, scioperi, ecc.)"
+    },
+
+    "soglie": {
+        "chiusura": 5,
+        "_chiusura_note": "Valore sotto cui considerare un giorno come chiuso (default: 5 chiamate)"
+    },
+
+    "output": {
+        "verbose": false,
+        "_verbose_note": "Se true, stampa messaggi di debug dettagliati",
+        "genera_grafici": true,
+        "_genera_grafici_note": "Se true, genera grafici PNG oltre ai file Excel"
+    },
+
+    "festivita_italiane": [
+        "Capodanno",
+        "Epifania",
+        "Festa_Liberazione",
+        "Festa_Lavoro",
+        "Festa_Repubblica",
+        "Ferragosto",
+        "Ognissanti",
+        "Immacolata",
+        "Natale",
+        "Santo_Stefano",
+        "Capodanno_Vigilia",
+        "Pasqua",
+        "Venerdi_Santo",
+        "PostPasqua",
+        "Periodo_Natalizio",
+        "Post_Capodanno"
+    ]
+}
