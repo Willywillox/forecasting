@@ -3499,7 +3499,7 @@ def _salva_forecast_completo(output_dir, confronto_df, backtest_metrics, best_mo
             {'Modello': 'sarima', 'Uso consigliato': 'Trend + stagionalità con correlazione autoregressiva', 'Note': 'Più lento, utile con dati stabili e lunghi'},
             {'Modello': 'prophet', 'Uso consigliato': 'Più stagionalità + festività personalizzate', 'Note': 'Gestisce cambi policy con festivi esclusi'},
             {'Modello': 'tbats', 'Uso consigliato': 'Multiple stagionalità complesse', 'Note': 'Richiede tbats installato, può essere lento'},
-            {'Modello': 'intraday_dinamico', 'Uso consigliato': 'Distribuzione per fascia oraria', 'Note': 'Allena 24 modelli, utile per staffing'},
+            {'Modello': 'intraday_dinamico', 'Uso consigliato': 'Distribuzione per fascia oraria', 'Note': 'Allena un modello per ogni fascia presente nei dati, utile per staffing'},
             {'Modello': 'ensemble_top2', 'Uso consigliato': 'Media dei migliori due modelli', 'Note': 'Riduce varianza, richiede almeno due modelli riusciti'},
         ]
         pd.DataFrame(guida_rows).to_excel(writer, sheet_name='Guida_Modelli', index=False)
@@ -6025,7 +6025,7 @@ class ForecastGUI:
    • Non hai dati per fascia oraria
 
 📊 CARATTERISTICHE:
-   • 24 modelli separati (uno per ogni ora)
+   • Un modello separato per ogni fascia presente nei dati
    • Ideale per workforce management
    • Include pattern giorno settimana per fascia
 
@@ -6259,7 +6259,7 @@ class ForecastGUI:
 • INTRADAY DINAMICO
   Distribuzione per fascia oraria basata su pattern storici.
   ✅ Pro: Ideale per pianificazione staffing
-  ⚠️ Contro: Richiede dati con granularità oraria
+  ⚠️ Contro: Richiede dati con granularità per fascia (oraria, 30min, 15min, ecc.)
 
 • ENSEMBLE HYBRID
   Combina i migliori modelli pesati per MAPE/SMAPE.
