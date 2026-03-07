@@ -43,6 +43,11 @@ LAST_UPDATE = "2025-11-23"
 import logging
 import math
 import matplotlib
+# Fix matplotlib font cache per PyInstaller: imposta MPLCONFIGDIR in una cartella scrivibile
+if getattr(sys, 'frozen', False):
+    _mpl_config = os.path.join(os.path.expanduser('~'), '.matplotlib_forecast')
+    os.makedirs(_mpl_config, exist_ok=True)
+    os.environ['MPLCONFIGDIR'] = _mpl_config
 matplotlib.use("Agg")
 import pandas as pd
 import numpy as np
@@ -70,12 +75,28 @@ warnings.filterwarnings('ignore')
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Fix encoding per Windows subprocess (supporto emoji)
+# Nota: con PyInstaller --noconsole, sys.stdout/stderr possono essere None
 if sys.platform == 'win32':
     import codecs
-    if sys.stdout.encoding != 'utf-8':
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+    elif hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding != 'utf-8':
         sys.stdout.reconfigure(encoding='utf-8')
-    if sys.stderr.encoding != 'utf-8':
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+    elif hasattr(sys.stderr, 'reconfigure') and sys.stderr.encoding != 'utf-8':
         sys.stderr.reconfigure(encoding='utf-8')
+
+# Fix finestre DOS lampeggianti: impedisce ai sotto-processi di aprire console visibili
+# Monkey-patch di subprocess.Popen per aggiungere CREATE_NO_WINDOW su Windows
+if sys.platform == 'win32':
+    import subprocess
+    _original_popen_init = subprocess.Popen.__init__
+    def _no_window_popen_init(self, *args, **kwargs):
+        if kwargs.get('creationflags', 0) == 0 and kwargs.get('shell', False) is False:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        _original_popen_init(self, *args, **kwargs)
+    subprocess.Popen.__init__ = _no_window_popen_init
 
 # Parametri globali per IC basate su quantili dei residui
 DEFAULT_ALPHA = 0.10  # 80% central interval by default
@@ -89,6 +110,291 @@ HOLIDAY_FLAGS = [
 
 VERBOSE = os.environ.get("FORECAST_VERBOSE", "0").lower() not in ("0", "false", "no", "")
 FAST_MODE = os.environ.get("FORECAST_FAST", "0").lower() not in ("0", "false", "no", "") or "--fast" in sys.argv
+AUTO_FESTIVI = os.environ.get("FORECAST_AUTO_FESTIVI", "1").lower() not in ("0", "false", "no", "")  # Abilitato di default
+PULISCI_ANOMALIE = os.environ.get("FORECAST_PULISCI_ANOMALIE", "0").lower() not in ("0", "false", "no", "")  # Disabilitato di default
+METODO_PULIZIA_ANOMALIE = os.environ.get("FORECAST_METODO_PULIZIA", "interpolate")  # interpolate, media_dow, escludi, cap
+_REGRESSORI_FILE_OVERRIDE = None  # Se impostato dalla GUI, usa questo file invece del default
+
+# ============================================================================
+# CARICAMENTO CONFIGURAZIONE DA FILE JSON
+# ============================================================================
+CONFIG_FILE = "forecast_config.json"
+_config_cache = None
+
+def _get_app_dir():
+    """Ritorna la cartella dell'applicazione (funziona sia in sviluppo che con PyInstaller)."""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller: usa la cartella dove si trova l'exe, NON la cartella temp _MEIPASS
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).parent
+
+def _carica_config():
+    """
+    Carica la configurazione da file JSON se presente.
+    Ritorna un dizionario con la configurazione, o {} se il file non esiste.
+    """
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
+
+    import json
+    config_path = _get_app_dir() / CONFIG_FILE
+
+    if config_path.exists():
+        try:
+            content = config_path.read_text(encoding='utf-8').strip()
+            if not content:
+                # File vuoto - ignora silenziosamente
+                _config_cache = {}
+                return _config_cache
+            _config_cache = json.loads(content)
+            print(f"   Configurazione caricata da: {config_path}")
+            return _config_cache
+        except Exception as e:
+            print(f"   ⚠️ Errore caricamento config: {e}")
+            _config_cache = {}
+            return _config_cache
+    else:
+        _config_cache = {}
+        return _config_cache
+
+def _get_config(sezione, chiave, default=None):
+    """
+    Recupera un valore dalla configurazione.
+
+    Args:
+        sezione: nome della sezione (es. 'forecast', 'modelli', 'festivita')
+        chiave: chiave all'interno della sezione
+        default: valore di default se non trovato
+
+    Returns:
+        Il valore dalla config o il default
+    """
+    config = _carica_config()
+    if sezione in config and isinstance(config[sezione], dict):
+        return config[sezione].get(chiave, default)
+    return default
+
+
+# ============================================================================
+# REGRESSORI ESTERNI (EVENTI, CAMPAGNE, ECC.)
+# ============================================================================
+_regressori_cache = None
+
+def carica_regressori_esterni(file_path=None):
+    """
+    Carica eventi esterni da file Excel per usarli come regressori nel forecast.
+
+    Il file deve avere le colonne:
+        - DATA: data dell'evento (formato YYYY-MM-DD o DD/MM/YYYY)
+        - EVENTO: nome/tipo evento (es. 'campagna_marketing', 'sciopero', 'black_friday')
+        - IMPATTO: effetto stimato in % (es. +20 per +20%, -30 per -30%)
+        - DURATA_GIORNI: (opzionale) durata effetto in giorni (default: 1)
+
+    Args:
+        file_path: path al file Excel. Se None, cerca 'eventi_esterni.xlsx' nella cartella script
+
+    Returns:
+        dict con:
+            - eventi_df: DataFrame con gli eventi
+            - n_eventi: numero eventi caricati
+            - tipi_evento: lista tipi unici
+    """
+    global _regressori_cache, _REGRESSORI_FILE_OVERRIDE
+
+    if file_path is None:
+        # Prima controlla se c'è un override dalla GUI
+        if _REGRESSORI_FILE_OVERRIDE and os.path.exists(_REGRESSORI_FILE_OVERRIDE):
+            file_path = _REGRESSORI_FILE_OVERRIDE
+        else:
+            # Cerca file di default
+            script_dir = _get_app_dir()
+            file_path = script_dir / 'eventi_esterni.xlsx'
+            if not file_path.exists():
+                return {'eventi_df': None, 'n_eventi': 0, 'tipi_evento': []}
+
+    file_path = Path(file_path)
+    if not file_path.exists():
+        print(f"   ⚠️ File eventi esterni non trovato: {file_path}")
+        return {'eventi_df': None, 'n_eventi': 0, 'tipi_evento': []}
+
+    try:
+        df = pd.read_excel(file_path)
+
+        # Normalizza nomi colonne
+        df.columns = [c.upper().strip() for c in df.columns]
+
+        # Verifica colonne obbligatorie
+        required = ['DATA', 'EVENTO', 'IMPATTO']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"   ⚠️ File eventi: colonne mancanti {missing}")
+            return {'eventi_df': None, 'n_eventi': 0, 'tipi_evento': []}
+
+        # Converti data
+        df['DATA'] = pd.to_datetime(df['DATA'], dayfirst=True, errors='coerce')
+        df = df.dropna(subset=['DATA'])
+
+        # Converti impatto in decimale (es. +20 -> 0.20)
+        df['IMPATTO'] = pd.to_numeric(df['IMPATTO'], errors='coerce').fillna(0) / 100
+
+        # Durata default = 1
+        if 'DURATA_GIORNI' not in df.columns:
+            df['DURATA_GIORNI'] = 1
+        df['DURATA_GIORNI'] = pd.to_numeric(df['DURATA_GIORNI'], errors='coerce').fillna(1).astype(int)
+
+        # Espandi eventi multi-giorno
+        expanded_rows = []
+        for _, row in df.iterrows():
+            for i in range(row['DURATA_GIORNI']):
+                expanded_rows.append({
+                    'DATA': row['DATA'] + pd.Timedelta(days=i),
+                    'EVENTO': row['EVENTO'],
+                    'IMPATTO': row['IMPATTO']
+                })
+
+        expanded_df = pd.DataFrame(expanded_rows)
+
+        # Raggruppa per data (somma impatti se più eventi stesso giorno)
+        daily_impact = expanded_df.groupby('DATA')['IMPATTO'].sum().reset_index()
+        daily_impact.columns = ['DATA', 'IMPATTO_TOTALE']
+
+        tipi = df['EVENTO'].unique().tolist()
+
+        print(f"   📅 Caricati {len(df)} eventi esterni ({len(tipi)} tipi)")
+        for tipo in tipi[:5]:  # Max 5 tipi
+            n = len(df[df['EVENTO'] == tipo])
+            print(f"      - {tipo}: {n} occorrenze")
+        if len(tipi) > 5:
+            print(f"      ... e altri {len(tipi) - 5} tipi")
+
+        _regressori_cache = {
+            'eventi_df': df,
+            'daily_impact': daily_impact,
+            'n_eventi': len(df),
+            'tipi_evento': tipi
+        }
+
+        return _regressori_cache
+
+    except Exception as e:
+        print(f"   ⚠️ Errore caricamento eventi esterni: {e}")
+        return {'eventi_df': None, 'n_eventi': 0, 'tipi_evento': []}
+
+
+def applica_regressori_a_forecast(forecast_df, regressori=None):
+    """
+    Applica gli impatti dei regressori esterni al forecast.
+
+    Args:
+        forecast_df: DataFrame con colonne ['DATA', 'FORECAST', ...]
+        regressori: dict da carica_regressori_esterni() o None per usare cache
+
+    Returns:
+        DataFrame con forecast corretto
+    """
+    global _regressori_cache
+
+    if regressori is None:
+        regressori = _regressori_cache
+
+    if regressori is None or regressori.get('daily_impact') is None:
+        return forecast_df
+
+    daily_impact = regressori['daily_impact']
+
+    if daily_impact.empty:
+        return forecast_df
+
+    forecast_corretto = forecast_df.copy()
+    forecast_corretto['DATA'] = pd.to_datetime(forecast_corretto['DATA'])
+
+    # Merge con impatti
+    forecast_corretto = forecast_corretto.merge(
+        daily_impact,
+        on='DATA',
+        how='left'
+    )
+    forecast_corretto['IMPATTO_TOTALE'] = forecast_corretto['IMPATTO_TOTALE'].fillna(0)
+
+    # Applica impatto
+    mask = forecast_corretto['IMPATTO_TOTALE'] != 0
+    n_applicati = mask.sum()
+
+    if n_applicati > 0:
+        forecast_corretto.loc[mask, 'FORECAST'] = (
+            forecast_corretto.loc[mask, 'FORECAST'] *
+            (1 + forecast_corretto.loc[mask, 'IMPATTO_TOTALE'])
+        )
+        print(f"   📊 Regressori esterni applicati a {n_applicati} giorni")
+
+    forecast_corretto = forecast_corretto.drop(columns=['IMPATTO_TOTALE'])
+
+    return forecast_corretto
+
+
+def crea_template_eventi_esterni(output_path=None):
+    """
+    Crea un file Excel template per gli eventi esterni.
+
+    Args:
+        output_path: path dove salvare il file. Se None, usa 'eventi_esterni_template.xlsx'
+
+    Returns:
+        Path del file creato
+    """
+    if output_path is None:
+        output_path = _get_app_dir() / 'eventi_esterni_template.xlsx'
+
+    esempio_df = pd.DataFrame({
+        'DATA': [
+            '2025-03-15', '2025-03-16', '2025-04-01',
+            '2025-05-10', '2025-11-29', '2025-12-24'
+        ],
+        'EVENTO': [
+            'campagna_marketing', 'campagna_marketing', 'lancio_prodotto',
+            'sciopero_trasporti', 'black_friday', 'vigilia_natale'
+        ],
+        'IMPATTO': [
+            20, 15, 30,
+            -25, 40, -50
+        ],
+        'DURATA_GIORNI': [
+            1, 1, 3,
+            1, 3, 1
+        ]
+    })
+
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        esempio_df.to_excel(writer, sheet_name='Eventi', index=False)
+
+        # Aggiungi foglio istruzioni
+        istruzioni = pd.DataFrame({
+            'Istruzioni': [
+                'Questo file serve per definire eventi esterni che influenzano il volume chiamate.',
+                '',
+                'COLONNE:',
+                '- DATA: data evento (YYYY-MM-DD o DD/MM/YYYY)',
+                '- EVENTO: nome/tipo evento (testo libero)',
+                '- IMPATTO: effetto in % (positivo = aumento, negativo = diminuzione)',
+                '- DURATA_GIORNI: durata effetto in giorni (opzionale, default 1)',
+                '',
+                'ESEMPI IMPATTO:',
+                '- Campagna marketing: +20% (IMPATTO = 20)',
+                '- Sciopero: -25% (IMPATTO = -25)',
+                '- Black Friday: +40% (IMPATTO = 40)',
+                '- Giorno prima chiusura: -50% (IMPATTO = -50)',
+                '',
+                'NOTE:',
+                '- Se più eventi cadono lo stesso giorno, gli impatti si sommano',
+                '- Salvare il file come "eventi_esterni.xlsx" nella cartella del programma',
+            ]
+        })
+        istruzioni.to_excel(writer, sheet_name='Istruzioni', index=False)
+
+    print(f"   ✅ Template eventi esterni creato: {output_path}")
+    return output_path
 
 
 def log_debug(message: str):
@@ -381,7 +687,7 @@ def trova_file_excel(custom_dirs=None):
     Se custom_dirs è valorizzato, cerca nei percorsi indicati;
     altrimenti usa la cartella dello script e la sottocartella ``file input``.
     """
-    script_dir = Path(__file__).resolve().parent
+    script_dir = _get_app_dir()
 
     search_roots = []
     seen = set()
@@ -442,11 +748,158 @@ def trova_file_excel(custom_dirs=None):
 # CARICAMENTO DATI
 # =============================================================================
 
+def valida_dati_input(df, file_path=None):
+    """
+    Valida i dati in input e segnala problemi.
+
+    Args:
+        df: DataFrame caricato
+        file_path: path del file (per messaggi di errore)
+
+    Returns:
+        dict con:
+            - valido: True se dati OK, False se critici
+            - errori: lista errori critici
+            - warning: lista warning non bloccanti
+            - suggerimenti: lista suggerimenti per migliorare
+    """
+    errori = []
+    warning = []
+    suggerimenti = []
+
+    file_name = Path(file_path).name if file_path else "file"
+
+    # Verifica DataFrame non vuoto
+    if df is None or df.empty:
+        errori.append(f"Il file {file_name} è vuoto o non leggibile")
+        return {'valido': False, 'errori': errori, 'warning': warning, 'suggerimenti': suggerimenti}
+
+    # Verifica colonne obbligatorie
+    colonne_richieste = ['DATA', 'FASCIA', 'OFFERTO']
+    colonne_presenti = [c.upper() for c in df.columns]
+    mancanti = [c for c in colonne_richieste if c not in colonne_presenti]
+    if mancanti:
+        errori.append(f"Colonne obbligatorie mancanti: {', '.join(mancanti)}")
+
+    # Verifica colonna GG SETT (può avere varianti)
+    gg_sett_trovato = False
+    for variante in ['GG SETT', 'GG_SETT', 'GIORNO', 'GIORNO_SETT', 'WEEKDAY']:
+        if variante in colonne_presenti:
+            gg_sett_trovato = True
+            break
+    if not gg_sett_trovato:
+        warning.append("Colonna 'GG SETT' non trovata - verrà calcolata dalla data")
+
+    if errori:
+        return {'valido': False, 'errori': errori, 'warning': warning, 'suggerimenti': suggerimenti}
+
+    # Normalizza nomi colonne
+    df.columns = [c.upper().strip() for c in df.columns]
+
+    # Verifica DATA
+    try:
+        date_series = pd.to_datetime(df['DATA'], errors='coerce')
+        n_date_invalide = date_series.isna().sum()
+        if n_date_invalide > 0:
+            pct = n_date_invalide / len(df) * 100
+            if pct > 10:
+                errori.append(f"{n_date_invalide} date non valide ({pct:.1f}% del dataset)")
+            else:
+                warning.append(f"{n_date_invalide} date non valide ({pct:.1f}%) - verranno escluse")
+    except Exception as e:
+        errori.append(f"Errore parsing colonna DATA: {e}")
+
+    # Verifica OFFERTO
+    if 'OFFERTO' in df.columns:
+        try:
+            offerto = pd.to_numeric(df['OFFERTO'], errors='coerce')
+            n_offerto_invalidi = offerto.isna().sum()
+            if n_offerto_invalidi > 0:
+                pct = n_offerto_invalidi / len(df) * 100
+                warning.append(f"{n_offerto_invalidi} valori OFFERTO non numerici ({pct:.1f}%)")
+
+            # Verifica valori negativi
+            n_negativi = (offerto < 0).sum()
+            if n_negativi > 0:
+                warning.append(f"{n_negativi} valori OFFERTO negativi - verranno convertiti in 0")
+
+            # Verifica valori troppo alti (possibili errori)
+            media = offerto.mean()
+            std = offerto.std()
+            soglia_alta = media + 10 * std
+            n_estremi = (offerto > soglia_alta).sum()
+            if n_estremi > 0:
+                suggerimenti.append(f"{n_estremi} valori OFFERTO molto alti (>10 std) - verificare se anomalie")
+
+        except Exception as e:
+            errori.append(f"Errore parsing colonna OFFERTO: {e}")
+
+    # Verifica periodo dati
+    if 'DATA' in df.columns:
+        try:
+            date_valide = pd.to_datetime(df['DATA'], errors='coerce').dropna()
+            if len(date_valide) > 0:
+                giorni_coperti = (date_valide.max() - date_valide.min()).days
+                if giorni_coperti < 14:
+                    warning.append(f"Solo {giorni_coperti} giorni di dati - forecast potrebbe essere poco affidabile")
+                elif giorni_coperti < 60:
+                    suggerimenti.append(f"{giorni_coperti} giorni di storico - più dati migliorerebbero l'accuratezza")
+
+                # Verifica buchi nei dati
+                date_range = pd.date_range(date_valide.min(), date_valide.max(), freq='D')
+                date_uniche = set(date_valide.dt.date)
+                date_mancanti = len(date_range) - len(date_uniche)
+                if date_mancanti > giorni_coperti * 0.1:
+                    warning.append(f"{date_mancanti} date mancanti nello storico ({date_mancanti/giorni_coperti*100:.1f}%)")
+        except Exception:
+            pass
+
+    # Verifica duplicati
+    if 'DATA' in df.columns and 'FASCIA' in df.columns:
+        try:
+            duplicati = df.duplicated(subset=['DATA', 'FASCIA']).sum()
+            if duplicati > 0:
+                warning.append(f"{duplicati} righe duplicate (stessa DATA+FASCIA)")
+        except Exception:
+            pass
+
+    valido = len(errori) == 0
+
+    # Stampa risultati
+    if errori:
+        print(f"   ❌ ERRORI CRITICI:")
+        for e in errori:
+            print(f"      - {e}")
+    if warning:
+        print(f"   ⚠️ WARNING:")
+        for w in warning:
+            print(f"      - {w}")
+    if suggerimenti and not errori:
+        print(f"   💡 SUGGERIMENTI:")
+        for s in suggerimenti:
+            print(f"      - {s}")
+    if valido and not warning:
+        print(f"   ✅ Validazione completata: dati OK")
+
+    return {
+        'valido': valido,
+        'errori': errori,
+        'warning': warning,
+        'suggerimenti': suggerimenti
+    }
+
+
 def carica_dati(file_path):
     """Carica e prepara i dati dal file Excel"""
     print("Caricamento dati...")
-    
+
     df = pd.read_excel(file_path)
+
+    # Validazione input
+    print("   Validazione dati...")
+    validazione = valida_dati_input(df, file_path)
+    if not validazione['valido']:
+        raise ValueError(f"Dati non validi: {'; '.join(validazione['errori'])}")
     df['DATA'] = pd.to_datetime(df['DATA'])
     df['ANNO'] = df['DATA'].dt.year
     df['MESE'] = df['DATA'].dt.month
@@ -463,7 +916,22 @@ def carica_dati(file_path):
         print(f"Attenzione: {invalid_count} fasce orarie con formato non riconosciuto (minuti impostati a -1)")
         df['MINUTI'] = df['MINUTI'].fillna(-1)
     df['MINUTI'] = df['MINUTI'].astype(int)
-    df['IS_WEEKEND'] = df['GG SETT'].isin(['sab', 'dom'])
+
+    # Normalizza varianti del nome colonna GG SETT
+    if 'GG_SETT' in df.columns and 'GG SETT' not in df.columns:
+        df.rename(columns={'GG_SETT': 'GG SETT'}, inplace=True)
+    elif 'GIORNO_SETT' in df.columns and 'GG SETT' not in df.columns:
+        df.rename(columns={'GIORNO_SETT': 'GG SETT'}, inplace=True)
+    elif 'GIORNO' in df.columns and 'GG SETT' not in df.columns:
+        df.rename(columns={'GIORNO': 'GG SETT'}, inplace=True)
+
+    # Se GG SETT non esiste, calcolalo dalla data
+    if 'GG SETT' not in df.columns:
+        giorni_map = {0: 'lun', 1: 'mar', 2: 'mer', 3: 'gio', 4: 'ven', 5: 'sab', 6: 'dom'}
+        df['GG SETT'] = df['DATA'].dt.dayofweek.map(giorni_map)
+        print("   Colonna 'GG SETT' calcolata automaticamente dalla data")
+
+    df['IS_WEEKEND'] = df['GG SETT'].isin(['sab', 'dom', 'fest'])
     if 'week' not in df.columns:
         df['week'] = df['DATA'].dt.isocalendar().week.astype(int)
     
@@ -533,7 +1001,7 @@ def analisi_giorno_settimana(df, output_dir):
     print("\nANALISI PER GIORNO DELLA SETTIMANA")
     print("=" * 60)
     
-    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom', 'fest']
     
     giorno_stats = df.groupby('GG SETT').agg({
         'OFFERTO': ['mean', 'median', 'std', 'sum', 'count']
@@ -544,7 +1012,7 @@ def analisi_giorno_settimana(df, output_dir):
     
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    colors = ['#A23B72' if g in ['sab', 'dom'] else '#2E86AB' for g in giorno_stats['GIORNO']]
+    colors = ['#A23B72' if g in ['sab', 'dom', 'fest'] else '#2E86AB' for g in giorno_stats['GIORNO']]
     axes[0].bar(giorno_stats['GIORNO'], giorno_stats['MEDIA'], color=colors, alpha=0.8)
     axes[0].set_title('Chiamate Medie per Giorno Settimana', fontsize=13, fontweight='bold')
     axes[0].set_ylabel('Chiamate Offerte (media per slot)')
@@ -633,7 +1101,7 @@ def crea_heatmap(df, output_dir):
     print("\nCREAZIONE HEATMAP")
     print("=" * 60)
     
-    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom', 'fest']
     pivot = df.pivot_table(values='OFFERTO', index='GG SETT', columns='FASCIA', aggfunc='mean')
     pivot = pivot.reindex(ordine_giorni)
     fasce_ordinate = df.sort_values('MINUTI')['FASCIA'].unique()
@@ -667,7 +1135,7 @@ def genera_curve_previsionali(df, output_dir):
     curve['intraday_generale'] = df.groupby(['FASCIA', 'MINUTI'])['OFFERTO'].mean().reset_index()
     curve['intraday_generale'] = curve['intraday_generale'].sort_values('MINUTI')
     
-    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom', 'fest']
     for giorno in ordine_giorni:
         curve[f'intraday_{giorno}'] = (df[df['GG SETT'] == giorno]
                                        .groupby(['FASCIA', 'MINUTI'])['OFFERTO']
@@ -872,6 +1340,146 @@ def identifica_anomalie(df, output_dir):
     print('Riepilogo anomalie salvato: anomalie_riepilogo.txt')
 
     return anomalie_alte, anomalie_basse
+
+
+def pulisci_storico_anomalie(df, metodo='interpolate', soglia_std=2.5, verbose=True):
+    """
+    Pulisce i dati storici rimuovendo o correggendo le anomalie.
+
+    Args:
+        df: DataFrame con colonne ['DATA', 'OFFERTO', ...]
+        metodo: 'interpolate' (interpola), 'media_dow' (media giorno settimana),
+                'escludi' (rimuove righe), 'cap' (limita ai bounds)
+        soglia_std: numero di deviazioni standard per definire anomalia (default: 2.5)
+        verbose: se True, stampa info sulle correzioni
+
+    Returns:
+        dict con:
+            - df_pulito: DataFrame corretto
+            - anomalie_rilevate: lista di date anomale
+            - n_corrette: numero di correzioni applicate
+            - report: stringa con dettagli
+    """
+    if df.empty:
+        return {'df_pulito': df, 'anomalie_rilevate': [], 'n_corrette': 0, 'report': 'DataFrame vuoto'}
+
+    df_work = df.copy()
+
+    # Aggrega per giorno
+    daily = df_work.groupby('DATA')['OFFERTO'].sum().reset_index()
+    daily.columns = ['DATA', 'TOTALE']
+    daily['DATA'] = pd.to_datetime(daily['DATA'])
+    daily['DOW'] = daily['DATA'].dt.dayofweek
+
+    # Calcola statistiche
+    media = daily['TOTALE'].mean()
+    std = daily['TOTALE'].std()
+    soglia_alta = media + soglia_std * std
+    soglia_bassa = max(0, media - soglia_std * std)
+
+    # Identifica anomalie
+    mask_anomalie = (daily['TOTALE'] > soglia_alta) | (daily['TOTALE'] < soglia_bassa)
+    date_anomale = daily.loc[mask_anomalie, 'DATA'].tolist()
+    n_anomalie = len(date_anomale)
+
+    if n_anomalie == 0:
+        if verbose:
+            print("   ✅ Nessuna anomalia rilevata nello storico")
+        return {
+            'df_pulito': df,
+            'anomalie_rilevate': [],
+            'n_corrette': 0,
+            'report': 'Nessuna anomalia rilevata'
+        }
+
+    if verbose:
+        print(f"   🔍 Rilevate {n_anomalie} anomalie nello storico (soglia: ±{soglia_std} std)")
+
+    report_lines = [f"Anomalie rilevate: {n_anomalie}", f"Metodo correzione: {metodo}", ""]
+
+    # Applica correzione in base al metodo
+    if metodo == 'escludi':
+        # Rimuovi completamente le righe con anomalie
+        df_pulito = df_work[~df_work['DATA'].isin(date_anomale)].copy()
+        if verbose:
+            print(f"   🗑️ Escluse {n_anomalie} date anomale dal dataset")
+        report_lines.append(f"Date escluse: {n_anomalie}")
+
+    elif metodo == 'media_dow':
+        # Sostituisci con la media del giorno della settimana
+        df_pulito = df_work.copy()
+        medie_dow = daily.groupby('DOW')['TOTALE'].mean()
+
+        for data_anomala in date_anomale:
+            dow = data_anomala.dayofweek
+            valore_corretto = medie_dow.get(dow, media)
+
+            # Calcola il fattore di scala per distribuire sulle fasce
+            totale_anomalo = daily.loc[daily['DATA'] == data_anomala, 'TOTALE'].iloc[0]
+            if totale_anomalo > 0:
+                fattore = valore_corretto / totale_anomalo
+                mask_data = df_pulito['DATA'] == data_anomala
+                df_pulito.loc[mask_data, 'OFFERTO'] = df_pulito.loc[mask_data, 'OFFERTO'] * fattore
+
+                if verbose:
+                    print(f"      {data_anomala.strftime('%Y-%m-%d')}: {totale_anomalo:.0f} → {valore_corretto:.0f} (media {['lun','mar','mer','gio','ven','sab','dom'][dow]})")
+                report_lines.append(f"{data_anomala.strftime('%Y-%m-%d')}: {totale_anomalo:.0f} → {valore_corretto:.0f}")
+
+    elif metodo == 'interpolate':
+        # Interpola i valori anomali
+        df_pulito = df_work.copy()
+        daily_interp = daily.copy()
+        daily_interp.loc[mask_anomalie, 'TOTALE'] = np.nan
+        daily_interp['TOTALE'] = daily_interp['TOTALE'].interpolate(method='linear')
+        daily_interp['TOTALE'] = daily_interp['TOTALE'].fillna(media)  # Fallback per estremi
+
+        for data_anomala in date_anomale:
+            totale_anomalo = daily.loc[daily['DATA'] == data_anomala, 'TOTALE'].iloc[0]
+            valore_interpolato = daily_interp.loc[daily_interp['DATA'] == data_anomala, 'TOTALE'].iloc[0]
+
+            if totale_anomalo > 0:
+                fattore = valore_interpolato / totale_anomalo
+                mask_data = df_pulito['DATA'] == data_anomala
+                df_pulito.loc[mask_data, 'OFFERTO'] = df_pulito.loc[mask_data, 'OFFERTO'] * fattore
+
+                if verbose:
+                    print(f"      {data_anomala.strftime('%Y-%m-%d')}: {totale_anomalo:.0f} → {valore_interpolato:.0f} (interpolato)")
+                report_lines.append(f"{data_anomala.strftime('%Y-%m-%d')}: {totale_anomalo:.0f} → {valore_interpolato:.0f}")
+
+    elif metodo == 'cap':
+        # Limita ai bounds (cap)
+        df_pulito = df_work.copy()
+
+        for data_anomala in date_anomale:
+            totale_anomalo = daily.loc[daily['DATA'] == data_anomala, 'TOTALE'].iloc[0]
+
+            if totale_anomalo > soglia_alta:
+                valore_cap = soglia_alta
+            else:
+                valore_cap = soglia_bassa
+
+            if totale_anomalo > 0:
+                fattore = valore_cap / totale_anomalo
+                mask_data = df_pulito['DATA'] == data_anomala
+                df_pulito.loc[mask_data, 'OFFERTO'] = df_pulito.loc[mask_data, 'OFFERTO'] * fattore
+
+                if verbose:
+                    print(f"      {data_anomala.strftime('%Y-%m-%d')}: {totale_anomalo:.0f} → {valore_cap:.0f} (capped)")
+                report_lines.append(f"{data_anomala.strftime('%Y-%m-%d')}: {totale_anomalo:.0f} → {valore_cap:.0f}")
+    else:
+        # Metodo non riconosciuto, ritorna originale
+        df_pulito = df_work
+        report_lines.append(f"Metodo '{metodo}' non riconosciuto, dati non modificati")
+
+    if verbose:
+        print(f"   ✅ Storico pulito: {n_anomalie} anomalie corrette con metodo '{metodo}'")
+
+    return {
+        'df_pulito': df_pulito,
+        'anomalie_rilevate': date_anomale,
+        'n_corrette': n_anomalie,
+        'report': '\n'.join(report_lines)
+    }
 
 
 def _rileva_alert(df, forecast_df, backtest_metrics, output_dir):
@@ -1104,6 +1712,30 @@ def dashboard_kpi_consuntivi(df, output_dir):
 
 
 # =============================================================================
+
+def _apply_floor_if_negative(daily_df, forecast_df, quantile=0.05):
+    """Raise negative forecasts to a per-day-of-week floor."""
+    daily_df = daily_df.copy()
+    daily_df['DOW'] = pd.to_datetime(daily_df['DATA']).dt.dayofweek
+    floors = daily_df.groupby('DOW')['OFFERTO'].quantile(quantile)
+    floor_by_dow = floors.to_dict()
+    dow = pd.to_datetime(forecast_df['DATA']).dt.dayofweek
+    floor_vals = dow.map(floor_by_dow).fillna(0).astype(float).values
+    forecast_vals = np.asarray(forecast_df['FORECAST'], dtype=float)
+    mask = forecast_vals < 0
+    if not mask.any():
+        return forecast_df
+    floor_nonneg = np.maximum(floor_vals, 0.0)
+    corrected = np.where(mask, floor_nonneg, forecast_vals)
+    forecast_df['FORECAST'] = corrected
+    if 'CI_LOWER' in forecast_df.columns:
+        ci_lower = np.asarray(forecast_df['CI_LOWER'], dtype=float)
+        forecast_df['CI_LOWER'] = np.where(mask, np.maximum(ci_lower, floor_nonneg), ci_lower)
+    if 'CI_UPPER' in forecast_df.columns:
+        ci_upper = np.asarray(forecast_df['CI_UPPER'], dtype=float)
+        forecast_df['CI_UPPER'] = np.where(mask, np.maximum(ci_upper, corrected), ci_upper)
+    return forecast_df
+
 # FORECAST AVANZATO - HOLT-WINTERS
 # =============================================================================
 
@@ -1220,6 +1852,16 @@ def _forecast_holtwinters(df, output_dir, giorni_forecast=28, produce_outputs=Tr
         if produce_outputs:
             print("   Uso metodo fallback giornaliero")
         forecast_daily_df = forecast_giornaliero_fallback(daily, giorni_forecast)
+
+    forecast_daily_df = _apply_floor_if_negative(daily.reset_index(), forecast_daily_df, quantile=0.05)
+
+    # IMPORTANTE: Applica correzione pattern chiusura (es. domeniche a zero)
+    forecast_daily_df = _correggi_forecast_con_storico(
+        forecast_daily_df,
+        df,
+        soglia_minima=5,
+        festivita_selezionate=None
+    )
 
     pattern_intraday = _costruisci_pattern_intraday(df)
     forecast_fascia_df = _distribuisci_forecast_per_fascia(pattern_intraday, forecast_daily_df)
@@ -1371,12 +2013,25 @@ def forecast_giornaliero_fallback(daily, giorni_forecast):
     last_date = daily.index.max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=giorni_forecast, freq='D')
 
+    # Calcola il valore minimo accettabile (20% della media storica)
+    min_forecast_value = overall_mean * 0.2 if overall_mean > 0 else 0.0
+
     forecasts = []
     for i, date in enumerate(future_dates):
         dow = date.dayofweek
         dow_value = pattern_dow.loc[dow]
         dow_factor = dow_value / pattern_mean if pattern_mean != 0 else 1.0
-        forecast_val = (base_value + trend * (i + 1)) * dow_factor
+
+        # Smorzamento esponenziale del trend: pieno effetto primi 14 giorni,
+        # poi si smorza gradualmente (a 90 giorni il trend conta solo ~7%)
+        damping_factor = 0.97 ** max(0, i - 14)
+        trend_contribution = trend * (i + 1) * damping_factor
+
+        # Calcola forecast con trend smorzato
+        forecast_val = (base_value + trend_contribution) * dow_factor
+
+        # Assicura che il valore non scenda sotto il minimo (evita degradazione a 0)
+        forecast_val = max(min_forecast_value, forecast_val)
         forecasts.append(max(0.0, forecast_val))
 
     residuals = daily['OFFERTO'].diff().dropna()
@@ -1391,21 +2046,42 @@ def forecast_giornaliero_fallback(daily, giorni_forecast):
 
 
 def _costruisci_pattern_intraday(df):
-    """Costruisce pattern intraday percentuali per ciascun giorno della settimana."""
+    """Costruisce pattern intraday percentuali per ciascun giorno della settimana.
+
+    Usa la mediana dei giorni con traffico > 0 per evitare che chiusure
+    straordinarie, festivi o anomalie inquinino il pattern con zeri spuri.
+    """
     pattern_intraday = {}
-    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+    ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom', 'fest']
     for giorno in ordine_giorni:
         df_giorno = df[df['GG SETT'] == giorno]
         if len(df_giorno) == 0:
             continue
-        pattern_fascia = df_giorno.groupby(['FASCIA', 'MINUTI'])['OFFERTO'].mean().reset_index()
+
+        # Identifica giorni "attivi" (con traffico totale > soglia minima)
+        # per escludere festivi/chiusure che cadono in giorni infrasettimanali
+        totali_per_data = df_giorno.groupby('DATA')['OFFERTO'].sum()
+        soglia_giorno_attivo = 5  # stessa soglia di chiusura
+        date_attive = totali_per_data[totali_per_data > soglia_giorno_attivo].index
+
+        if len(date_attive) > 0:
+            df_giorno_filtrato = df_giorno[df_giorno['DATA'].isin(date_attive)]
+        else:
+            df_giorno_filtrato = df_giorno
+
+        # Usa la mediana per resistenza agli outlier
+        pattern_fascia = df_giorno_filtrato.groupby(['FASCIA', 'MINUTI'])['OFFERTO'].median().reset_index()
         pattern_fascia = pattern_fascia.sort_values('MINUTI')
         totale_giorno = pattern_fascia['OFFERTO'].sum()
         if totale_giorno > 0:
             pattern_fascia['PERCENTUALE'] = pattern_fascia['OFFERTO'] / totale_giorno
         else:
-            pattern_fascia['PERCENTUALE'] = 0
+            pattern_fascia['PERCENTUALE'] = 1.0 / len(pattern_fascia)
         pattern_intraday[giorno] = pattern_fascia
+
+    # Normalizza pattern per garantire sum(PERCENTUALE) = 1.0
+    pattern_intraday = _validate_and_normalize_percentages(pattern_intraday)
+
     return pattern_intraday
 
 
@@ -1430,7 +2106,173 @@ def _distribuisci_forecast_per_fascia(pattern_intraday, daily_forecast_df):
     if not forecast_fascia_list:
         return pd.DataFrame(columns=['DATA', 'GG_SETT', 'FASCIA', 'MINUTI',
                                      'FORECAST_GIORNO', 'PERCENTUALE', 'FORECAST_FASCIA'])
-    return pd.concat(forecast_fascia_list, ignore_index=True)
+
+    result = pd.concat(forecast_fascia_list, ignore_index=True)
+
+    # Applica vincolo giornaliero: sum(FORECAST_FASCIA per data) = FORECAST_GIORNO
+    result = _apply_daily_constraint(result)
+
+    return result
+
+
+def _validate_and_normalize_percentages(pattern_dict, tolerance=0.01):
+    """
+    Valida e normalizza i pattern percentuali intraday.
+
+    Args:
+        pattern_dict: Dict mapping day_of_week -> DataFrame with PERCENTUALE column
+        tolerance: Acceptable deviation from sum=1.0
+
+    Returns:
+        Dict with normalized patterns
+    """
+    normalized = {}
+    for day, pattern_df in pattern_dict.items():
+        if pattern_df.empty:
+            normalized[day] = pattern_df
+            continue
+
+        total_pct = pattern_df['PERCENTUALE'].sum()
+
+        # Log warning if sum deviates significantly
+        if abs(total_pct - 1.0) > tolerance:
+            print(f"      ⚠️  Giorno {day}: sum(PERCENTUALE) = {total_pct:.4f}, normalizing...")
+
+        # Normalize to ensure sum = 1.0
+        if total_pct > 0:
+            pattern_df = pattern_df.copy()
+            pattern_df['PERCENTUALE'] = pattern_df['PERCENTUALE'] / total_pct
+        else:
+            # If all zeros, distribute equally
+            pattern_df = pattern_df.copy()
+            pattern_df['PERCENTUALE'] = 1.0 / len(pattern_df)
+
+        normalized[day] = pattern_df
+
+    return normalized
+
+
+def _apply_daily_constraint(fascia_forecast_df):
+    """
+    Ensures that sum of per-slot forecasts equals the daily forecast anchor.
+
+    Args:
+        fascia_forecast_df: DataFrame with columns [DATA, FORECAST_GIORNO, FORECAST_FASCIA]
+
+    Returns:
+        DataFrame with corrected FORECAST_FASCIA values
+    """
+    if fascia_forecast_df.empty:
+        return fascia_forecast_df
+
+    df = fascia_forecast_df.copy()
+
+    for date in df['DATA'].unique():
+        mask = df['DATA'] == date
+        daily_total = df.loc[mask, 'FORECAST_GIORNO'].iloc[0]
+        slot_sum = df.loc[mask, 'FORECAST_FASCIA'].sum()
+
+        if slot_sum > 0 and abs(slot_sum - daily_total) > 0.01:
+            # Proportionally adjust to match daily total
+            adjustment_factor = daily_total / slot_sum
+            df.loc[mask, 'FORECAST_FASCIA'] *= adjustment_factor
+
+            # Recalculate percentages to maintain consistency
+            df.loc[mask, 'PERCENTUALE'] = df.loc[mask, 'FORECAST_FASCIA'] / daily_total
+
+    return df
+
+
+def _apply_weekday_ratio_correction(forecast_df, df_historical, correction_strength=0.8):
+    """
+    Applies weekday ratio correction to align forecast with historical weekday patterns.
+
+    This function addresses the issue where forecast models (especially Holt-Winters, SARIMA)
+    don't properly capture weekly seasonality. For example, Saturday might have 87% lower
+    volume than weekdays historically, but models overestimate it due to overall trends.
+
+    Args:
+        forecast_df: DataFrame with columns [DATA, FORECAST, GG_SETT]
+        df_historical: Original historical data with [DATA, OFFERTO, GG SETT]
+        correction_strength: Float 0-1, how much to apply correction (1=full, 0=none)
+
+    Returns:
+        DataFrame with corrected FORECAST values
+    """
+    if forecast_df.empty or df_historical.empty:
+        return forecast_df
+
+    df = forecast_df.copy()
+
+    # Calculate historical weekday averages
+    df_hist_daily = df_historical.groupby('DATA').agg({
+        'OFFERTO': 'sum',
+        'GG SETT': 'first'
+    }).reset_index()
+
+    hist_weekday_avg = df_hist_daily.groupby('GG SETT')['OFFERTO'].mean()
+    hist_overall_avg = df_hist_daily['OFFERTO'].mean()
+
+    # Calculate historical ratios (weekday avg / overall avg)
+    hist_ratios = {}
+    for weekday in hist_weekday_avg.index:
+        if hist_overall_avg > 0:
+            hist_ratios[weekday] = hist_weekday_avg[weekday] / hist_overall_avg
+        else:
+            hist_ratios[weekday] = 1.0
+
+    # Calculate forecast weekday averages
+    forecast_weekday_avg = df.groupby('GG_SETT')['FORECAST'].mean()
+    forecast_overall_avg = df['FORECAST'].mean()
+
+    if forecast_overall_avg <= 0:
+        return df
+
+    # Calculate forecast ratios
+    forecast_ratios = {}
+    for weekday in forecast_weekday_avg.index:
+        if forecast_overall_avg > 0:
+            forecast_ratios[weekday] = forecast_weekday_avg[weekday] / forecast_overall_avg
+        else:
+            forecast_ratios[weekday] = 1.0
+
+    # Apply correction for each weekday
+    corrections_applied = []
+    for weekday in hist_ratios.keys():
+        mask = df['GG_SETT'] == weekday
+        if mask.sum() == 0:
+            continue
+
+        hist_ratio = hist_ratios[weekday]
+        forecast_ratio = forecast_ratios.get(weekday, hist_ratio)
+
+        # Calculate scaling factor with correction strength
+        if forecast_ratio > 0:
+            target_ratio = hist_ratio
+            current_ratio = forecast_ratio
+            scale_factor = target_ratio / current_ratio
+
+            # Apply partial correction based on strength
+            scale_factor = 1 + (scale_factor - 1) * correction_strength
+
+            old_avg = df.loc[mask, 'FORECAST'].mean()
+            df.loc[mask, 'FORECAST'] *= scale_factor
+            new_avg = df.loc[mask, 'FORECAST'].mean()
+
+            # Track significant corrections
+            pct_change = ((new_avg - old_avg) / old_avg * 100) if old_avg > 0 else 0
+            if abs(pct_change) > 10:
+                corrections_applied.append(
+                    f"{weekday}: {old_avg:.0f} → {new_avg:.0f} ({pct_change:+.1f}%)"
+                )
+
+    # Report corrections
+    if corrections_applied:
+        print(f"      📊 Weekday ratio corrections applied:")
+        for correction in corrections_applied:
+            print(f"         {correction}")
+
+    return df
 
 
 def _stima_intervallo_confidenza(residuals, forecast_values, fallback_ratio=0.15):
@@ -1560,13 +2402,47 @@ def _esegui_backtest(df, metodi, giorni_forecast, fast_mode=False):
 def carica_dati_consuntivo(file_path):
     """
     Carica file Excel consuntivo con stesso formato del forecast.
-    Assume colonne: DATA, OFFERTO
+    Accetta colonne: DATA + (OFFERTO | CONSUNTIVO | CHIAMATE | ACTUAL | REALE)
     """
     df = pd.read_excel(file_path)
-    df['DATA'] = pd.to_datetime(df['DATA'])
+
+    # Normalizza nomi colonne
+    df.columns = [c.upper().strip() for c in df.columns]
+
+    # Cerca colonna data
+    data_cols = ['DATA', 'DATE', 'GIORNO', 'DT']
+    data_col = None
+    for col in data_cols:
+        if col in df.columns:
+            data_col = col
+            break
+    if data_col is None:
+        raise ValueError(f"Colonna data non trovata. Attese: {data_cols}. Trovate: {list(df.columns)}")
+
+    df['DATA'] = pd.to_datetime(df[data_col])
+
+    # Cerca colonna valori (OFFERTO o alternative)
+    value_cols = ['OFFERTO', 'FORECAST', 'CONSUNTIVO', 'CHIAMATE', 'ACTUAL', 'REALE', 'VALORE', 'VALUE', 'TOTALE']
+    value_col = None
+    for col in value_cols:
+        if col in df.columns:
+            value_col = col
+            break
+
+    if value_col is None:
+        raise ValueError(f"Colonna valori non trovata. Attese: {value_cols}. Trovate: {list(df.columns)}")
+
+    # Rinomina in OFFERTO per compatibilità
+    if value_col != 'OFFERTO':
+        df['OFFERTO'] = df[value_col]
+        print(f"   ℹ️ Colonna '{value_col}' usata come OFFERTO")
+
     # Aggrega per giorno se ci sono fasce orarie
     if 'FASCIA' in df.columns:
         df = df.groupby('DATA')['OFFERTO'].sum().reset_index()
+    else:
+        df = df[['DATA', 'OFFERTO']].copy()
+
     return df
 
 
@@ -1632,10 +2508,27 @@ def confronta_forecast_consuntivo(forecast_df, consuntivo_path, output_dir):
         mape = np.mean(np.abs((actual - predicted) / actual)) * 100
         smape = np.mean(2 * np.abs(predicted - actual) / (np.abs(predicted) + np.abs(actual))) * 100
 
+        # Metriche aggiuntive
+        rmse = np.sqrt(np.mean((actual - predicted) ** 2))
+        bias = np.mean(predicted - actual)  # Positivo = sovrastima, Negativo = sottostima
+        correlation = np.corrcoef(actual, predicted)[0, 1] if len(actual) > 1 else 0.0
+
+        # Accuratezza per fascia di errore
+        errori_pct = np.abs((actual - predicted) / actual) * 100
+        within_5pct = np.sum(errori_pct <= 5) / len(errori_pct) * 100
+        within_10pct = np.sum(errori_pct <= 10) / len(errori_pct) * 100
+        within_20pct = np.sum(errori_pct <= 20) / len(errori_pct) * 100
+
         metriche[model] = {
             'MAE': float(mae),
             'MAPE': float(mape),
             'SMAPE': float(smape),
+            'RMSE': float(rmse),
+            'BIAS': float(bias),
+            'Correlazione': float(correlation),
+            'Entro_5pct': float(within_5pct),
+            'Entro_10pct': float(within_10pct),
+            'Entro_20pct': float(within_20pct),
             'n_giorni': len(actual)
         }
 
@@ -1643,16 +2536,76 @@ def confronta_forecast_consuntivo(forecast_df, consuntivo_path, output_dir):
         merged[f'{model}_errore'] = merged[model] - merged['OFFERTO']
         merged[f'{model}_errore_pct'] = ((merged[model] - merged['OFFERTO']) / merged['OFFERTO'] * 100)
 
+    # Calcola metriche per giorno della settimana
+    merged['DOW'] = pd.to_datetime(merged['DATA']).dt.dayofweek
+    merged['IS_WEEKEND'] = merged['DOW'] >= 5
+
+    metriche_weekday = {}
+    metriche_weekend = {}
+    for model in model_cols:
+        if model not in merged.columns:
+            continue
+
+        # Weekday
+        wd = merged[~merged['IS_WEEKEND']]
+        if len(wd) > 0:
+            actual_wd = wd['OFFERTO'].values
+            pred_wd = wd[model].values
+            mask = ~(np.isnan(actual_wd) | np.isnan(pred_wd))
+            if mask.sum() > 0:
+                metriche_weekday[model] = {
+                    'MAE': float(np.mean(np.abs(actual_wd[mask] - pred_wd[mask]))),
+                    'MAPE': float(np.mean(np.abs((actual_wd[mask] - pred_wd[mask]) / actual_wd[mask])) * 100)
+                }
+
+        # Weekend
+        we = merged[merged['IS_WEEKEND']]
+        if len(we) > 0:
+            actual_we = we['OFFERTO'].values
+            pred_we = we[model].values
+            mask = ~(np.isnan(actual_we) | np.isnan(pred_we))
+            if mask.sum() > 0:
+                metriche_weekend[model] = {
+                    'MAE': float(np.mean(np.abs(actual_we[mask] - pred_we[mask]))),
+                    'MAPE': float(np.mean(np.abs((actual_we[mask] - pred_we[mask]) / actual_we[mask])) * 100)
+                }
+
     # Stampa risultati
-    print("\nMetriche di accuratezza per modello:")
+    print("\n" + "-" * 80)
+    print("METRICHE DI ACCURATEZZA PER MODELLO (ordinato per MAPE)")
+    print("-" * 80)
+    print(f"{'Modello':20s} {'MAE':>8s} {'MAPE':>8s} {'RMSE':>8s} {'BIAS':>8s} {'Corr':>6s} {'<10%':>6s}")
+    print("-" * 80)
     for model, metrics in sorted(metriche.items(), key=lambda x: x[1]['MAPE']):
-        print(f"  {model:20s}: MAE={metrics['MAE']:8.1f}  MAPE={metrics['MAPE']:6.2f}%  SMAPE={metrics['SMAPE']:6.2f}%")
+        bias_str = f"+{metrics['BIAS']:.0f}" if metrics['BIAS'] > 0 else f"{metrics['BIAS']:.0f}"
+        print(f"  {model:18s} {metrics['MAE']:8.1f} {metrics['MAPE']:7.2f}% {metrics['RMSE']:8.1f} {bias_str:>8s} {metrics['Correlazione']:6.2f} {metrics['Entro_10pct']:5.1f}%")
+
+    # Miglior modello
+    best_model = min(metriche.items(), key=lambda x: x[1]['MAPE'])
+    print("\n" + "=" * 80)
+    print(f"🏆 MIGLIOR MODELLO: {best_model[0].upper()}")
+    print(f"   MAPE: {best_model[1]['MAPE']:.2f}% | Entro 10%: {best_model[1]['Entro_10pct']:.1f}% dei giorni")
+    if best_model[1]['BIAS'] > 10:
+        print(f"   ⚠️ Attenzione: il modello tende a SOVRASTIMARE di ~{best_model[1]['BIAS']:.0f} chiamate/giorno")
+    elif best_model[1]['BIAS'] < -10:
+        print(f"   ⚠️ Attenzione: il modello tende a SOTTOSTIMARE di ~{abs(best_model[1]['BIAS']):.0f} chiamate/giorno")
+    print("=" * 80)
+
+    # Stampa breakdown weekday/weekend se significativo
+    if metriche_weekday and metriche_weekend:
+        print("\nAccuratezza per tipo giorno:")
+        print(f"  {'Modello':20s} {'Feriali MAPE':>14s} {'Weekend MAPE':>14s}")
+        for model in model_cols:
+            if model in metriche_weekday and model in metriche_weekend:
+                print(f"  {model:20s} {metriche_weekday[model]['MAPE']:13.2f}% {metriche_weekend[model]['MAPE']:13.2f}%")
 
     # Salva Excel dettagliato
     excel_path = Path(output_dir) / 'confronto_forecast_consuntivo.xlsx'
     with safe_excel_writer(excel_path, engine='xlsxwriter') as (writer, actual_path):
         # Sheet 1: Confronto giornaliero completo
-        merged.to_excel(writer, sheet_name='Confronto_Giornaliero', index=False)
+        cols_to_drop = ['DOW', 'IS_WEEKEND'] if 'DOW' in merged.columns else []
+        merged_export = merged.drop(columns=cols_to_drop, errors='ignore')
+        merged_export.to_excel(writer, sheet_name='Confronto_Giornaliero', index=False)
 
         # Sheet 2: Metriche riepilogo
         metrics_df = pd.DataFrame(metriche).T
@@ -1660,16 +2613,72 @@ def confronta_forecast_consuntivo(forecast_df, consuntivo_path, output_dir):
         metrics_df = metrics_df.sort_values('MAPE')
         metrics_df.to_excel(writer, sheet_name='Metriche_Accuratezza')
 
-        # Sheet 3: Aggregazione settimanale
+        # Sheet 3: Metriche Weekday/Weekend
+        if metriche_weekday and metriche_weekend:
+            wd_df = pd.DataFrame(metriche_weekday).T
+            wd_df.columns = [f'Feriali_{c}' for c in wd_df.columns]
+            we_df = pd.DataFrame(metriche_weekend).T
+            we_df.columns = [f'Weekend_{c}' for c in we_df.columns]
+            breakdown_df = pd.concat([wd_df, we_df], axis=1)
+            breakdown_df.index.name = 'Modello'
+            breakdown_df.to_excel(writer, sheet_name='Metriche_per_TipoGiorno')
+
+        # Sheet 4: Aggregazione settimanale
         merged_copy = merged.copy()
         merged_copy['DATA'] = pd.to_datetime(merged_copy['DATA'])
         merged_copy = merged_copy.set_index('DATA')
         weekly = merged_copy.resample('W-MON').sum(numeric_only=True).reset_index()
         weekly.to_excel(writer, sheet_name='Confronto_Settimanale', index=False)
 
-        # Sheet 4: Aggregazione mensile
+        # Sheet 5: Aggregazione mensile
         monthly = merged_copy.resample('MS').sum(numeric_only=True).reset_index()
         monthly.to_excel(writer, sheet_name='Confronto_Mensile', index=False)
+
+        # Sheet 6: Raccomandazioni
+        raccomandazioni = []
+        best_mape = best_model[1]['MAPE']
+        best_name = best_model[0]
+
+        raccomandazioni.append({
+            'Categoria': 'Modello Consigliato',
+            'Descrizione': f'Il modello migliore è {best_name.upper()} con MAPE {best_mape:.2f}%'
+        })
+
+        if best_mape < 10:
+            raccomandazioni.append({
+                'Categoria': 'Qualità Forecast',
+                'Descrizione': '✅ ECCELLENTE: errore medio sotto il 10%'
+            })
+        elif best_mape < 20:
+            raccomandazioni.append({
+                'Categoria': 'Qualità Forecast',
+                'Descrizione': '✅ BUONO: errore medio tra 10-20%'
+            })
+        else:
+            raccomandazioni.append({
+                'Categoria': 'Qualità Forecast',
+                'Descrizione': '⚠️ DA MIGLIORARE: errore medio sopra il 20%'
+            })
+
+        if best_model[1]['BIAS'] > 20:
+            raccomandazioni.append({
+                'Categoria': 'Bias Sistematico',
+                'Descrizione': f"⚠️ Il modello tende a SOVRASTIMARE di ~{best_model[1]['BIAS']:.0f} chiamate. Considera fattore correttivo."
+            })
+        elif best_model[1]['BIAS'] < -20:
+            raccomandazioni.append({
+                'Categoria': 'Bias Sistematico',
+                'Descrizione': f"⚠️ Il modello tende a SOTTOSTIMARE di ~{abs(best_model[1]['BIAS']):.0f} chiamate. Considera fattore correttivo."
+            })
+
+        if best_model[1]['Entro_10pct'] > 70:
+            raccomandazioni.append({
+                'Categoria': 'Affidabilità',
+                'Descrizione': f"✅ {best_model[1]['Entro_10pct']:.0f}% dei giorni ha errore <10% - previsioni affidabili per pianificazione"
+            })
+
+        racc_df = pd.DataFrame(raccomandazioni)
+        racc_df.to_excel(writer, sheet_name='Raccomandazioni', index=False)
 
     print(f"✅ File confronto salvato: {actual_path.name}")
 
@@ -1679,6 +2688,10 @@ def confronta_forecast_consuntivo(forecast_df, consuntivo_path, output_dir):
     return {
         'confronto_df': merged,
         'metriche': metriche,
+        'metriche_weekday': metriche_weekday,
+        'metriche_weekend': metriche_weekend,
+        'best_model': best_model[0],
+        'best_mape': best_model[1]['MAPE'],
         'periodo_overlap': (merged['DATA'].min(), merged['DATA'].max()),
         'output_path': actual_path
     }
@@ -1768,7 +2781,13 @@ def _process_single_fascia_intraday(args):
         # Crea serie temporale per questa fascia
         ts = df_fascia_subset.groupby('DATA')['OFFERTO'].mean().sort_index()
         ts = ts.asfreq('D', fill_value=0)
-        
+
+        # Cap outliers per prevenire forecast esplosivi
+        ts_percentile_95 = ts.quantile(0.95)
+        if ts_percentile_95 > 0:
+            ts = ts.clip(upper=ts_percentile_95 * 1.5)  # Consenti 50% sopra 95° percentile
+        ts = ts.clip(lower=0)  # Mai negativo
+
         try:
             # Modello Holt-Winters con stagionalita settimanale
             model = ExponentialSmoothing(
@@ -1809,10 +2828,16 @@ def _process_single_fascia_intraday(args):
         return []
 
 
-def _forecast_intraday_dinamico(df, giorni_forecast=28, produce_outputs=False):
+def _forecast_intraday_dinamico(df, giorni_forecast=28, daily_anchor_df=None, produce_outputs=False):
     """
     Forecast intraday dinamico con modelli separati per fascia oraria.
     Cattura le interazioni giorno×fascia in modo più accurato rispetto ai pattern fissi.
+
+    Args:
+        df: Historical data
+        giorni_forecast: Forecast horizon
+        daily_anchor_df: Optional daily forecast to use as constraint (prevents slot sum explosion)
+        produce_outputs: Verbose logging
     """
     if not STATSMODELS_AVAILABLE:
         if produce_outputs:
@@ -1875,6 +2900,31 @@ def _forecast_intraday_dinamico(df, giorni_forecast=28, produce_outputs=False):
         # Calcola anche totale giornaliero per compatibilità
         daily_forecast = forecast_df.groupby(['DATA', 'GG_SETT'])['FORECAST'].sum().reset_index()
         daily_forecast.columns = ['DATA', 'GG_SETT', 'FORECAST']
+
+        # Applica vincolo giornaliero se fornito (previene esplosione dei valori)
+        if daily_anchor_df is not None:
+            if produce_outputs:
+                print(f"   📌 Applicando vincolo giornaliero da anchor forecast...")
+
+            for _, anchor_row in daily_anchor_df.iterrows():
+                anchor_date = anchor_row['DATA']
+                anchor_value = anchor_row['FORECAST']
+
+                mask = forecast_df['DATA'] == anchor_date
+                if mask.sum() > 0:
+                    current_sum = forecast_df.loc[mask, 'FORECAST'].sum()
+
+                    if current_sum > 0 and abs(current_sum - anchor_value) / anchor_value > 0.05:
+                        # Somma slot differisce dall'anchor di >5%, applica correzione
+                        scale_factor = anchor_value / current_sum
+                        forecast_df.loc[mask, 'FORECAST'] *= scale_factor
+
+                        if produce_outputs:
+                            print(f"      Data {anchor_date}: scaled {current_sum:.1f} → {anchor_value:.1f} (factor: {scale_factor:.3f})")
+
+            # Ricalcola daily totals dopo constraint
+            daily_forecast = forecast_df.groupby(['DATA', 'GG_SETT'])['FORECAST'].sum().reset_index()
+            daily_forecast.columns = ['DATA', 'GG_SETT', 'FORECAST']
 
         if produce_outputs:
             print(f"   Forecast intraday dinamico completato: {len(forecast_df)} slot previsti")
@@ -2146,9 +3196,13 @@ def _forecast_prophet(df, giorni_forecast=28, produce_outputs=False, escludi_fes
 
     # ✨ NUOVO: Filtra festività escluse se richiesto
     if escludi_festivita:
-        festivita = festivita[~festivita['holiday'].isin(escludi_festivita)]
+        exclude_norm = {_normalizza_nome_festivita(h) for h in escludi_festivita if h}
+        festivita = festivita.copy()
+        festivita['holiday_norm'] = festivita['holiday'].apply(_normalizza_nome_festivita)
+        festivita = festivita[~festivita['holiday_norm'].isin(exclude_norm)]
+        festivita = festivita.drop(columns=['holiday_norm'])
         if produce_outputs and len(escludi_festivita) > 0:
-            print(f"   Festività escluse da Prophet: {', '.join(escludi_festivita)}")
+            print(f"   Festivita' escluse da Prophet: {', '.join(escludi_festivita)}")
 
     model = Prophet(
         holidays=festivita if not festivita.empty else None,  # Gestione festività
@@ -2249,6 +3303,7 @@ def _forecast_tbats(df, giorni_forecast=28, produce_outputs=False):
             'CI_LOWER': np.clip(conf_int['lower_bound'], a_min=0, a_max=None),
             'CI_UPPER': np.clip(conf_int['upper_bound'], a_min=0, a_max=None)
         })
+        forecast_daily_df = _apply_floor_if_negative(daily, forecast_daily_df, quantile=0.05)
 
         pattern_intraday = _costruisci_pattern_intraday(df)
         forecast_fascia_df = _distribuisci_forecast_per_fascia(pattern_intraday, forecast_daily_df)
@@ -2294,6 +3349,7 @@ def _forecast_tbats(df, giorni_forecast=28, produce_outputs=False):
                 'CI_LOWER': np.clip(conf_int['lower_bound'], a_min=0, a_max=None),
                 'CI_UPPER': np.clip(conf_int['upper_bound'], a_min=0, a_max=None)
             })
+            forecast_daily_df = _apply_floor_if_negative(daily, forecast_daily_df, quantile=0.05)
 
             pattern_intraday = _costruisci_pattern_intraday(df)
             forecast_fascia_df = _distribuisci_forecast_per_fascia(pattern_intraday, forecast_daily_df)
@@ -2826,15 +3882,20 @@ def _forecast_ensemble_hybrid(df, tutti_forecast, backtest_metrics, giorni_forec
             scores_monthly[nome_modello] = _score_componente_mensile(df, comp)
             scores_trend[nome_modello] = _score_componente_trend(df, comp)
 
-            # Volume: usa MAPE dal backtest se disponibile
+            volume_score = None
             if backtest_metrics and nome_modello in backtest_metrics:
                 mape = backtest_metrics[nome_modello].get('MAPE', float('inf'))
-                scores_volume[nome_modello] = mape if np.isfinite(mape) else float('inf')
-            else:
+                if np.isfinite(mape):
+                    volume_score = mape
+            if volume_score is None:
                 forecast_df = tutti_forecast[nome_modello]
                 if isinstance(forecast_df, dict):
                     forecast_df = forecast_df.get('giornaliero')
-                scores_volume[nome_modello] = _score_volume_totale(df, forecast_df)
+                volume_score = _score_volume_totale(df, forecast_df)
+                if forecast_df is not None and hasattr(forecast_df, 'columns') and 'FORECAST' in forecast_df.columns:
+                    if (forecast_df['FORECAST'] < 0).any():
+                        volume_score = float('inf')
+            scores_volume[nome_modello] = volume_score
 
         # Seleziona migliori per ogni componente
         best_weekly = min(scores_weekly, key=scores_weekly.get) if scores_weekly else None
@@ -2948,29 +4009,49 @@ def _forecast_ensemble_hybrid(df, tutti_forecast, backtest_metrics, giorni_forec
 
                 # Raggruppa per giorno settimana e calcola pattern percentuali
                 pattern_intraday = {}
-                ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+                ordine_giorni = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom', 'fest']
 
                 for giorno in ordine_giorni:
-                    df_giorno = fascia_df[fascia_df['GG_SETT'] == giorno].copy()
-                    if len(df_giorno) == 0:
-                        continue
+                    # CRITICAL FIX: Usa dati storici per costruire il pattern, NON i forecast!
+                    # Il forecast di intraday_dinamico è già in valori assoluti, non percentuali.
+                    # Usare FORECAST causerebbe una doppia applicazione dei valori.
 
-                    # Calcola media per fascia e percentuale sul totale giornaliero
-                    pattern_fascia = df_giorno.groupby(['FASCIA', 'MINUTI'])['FORECAST'].mean().reset_index()
-                    pattern_fascia = pattern_fascia.sort_values('MINUTI')
+                    # Costruisci pattern da dati storici OFFERTO
+                    df_hist_giorno = df[df['GG SETT'] == giorno].copy()
 
-                    totale_giorno = pattern_fascia['FORECAST'].sum()
-                    if totale_giorno > 0:
-                        pattern_fascia['PERCENTUALE'] = pattern_fascia['FORECAST'] / totale_giorno
+                    if len(df_hist_giorno) > 0:
+                        # Pattern basato su dati storici reali
+                        pattern_fascia = df_hist_giorno.groupby(['FASCIA', 'MINUTI'])['OFFERTO'].mean().reset_index()
+                        pattern_fascia = pattern_fascia.sort_values('MINUTI')
+
+                        totale_giorno = pattern_fascia['OFFERTO'].sum()
+                        if totale_giorno > 0:
+                            pattern_fascia['PERCENTUALE'] = pattern_fascia['OFFERTO'] / totale_giorno
+                        else:
+                            pattern_fascia['PERCENTUALE'] = 1.0 / len(pattern_fascia)
+
+                        pattern_intraday[giorno] = pattern_fascia
                     else:
-                        pattern_fascia['PERCENTUALE'] = 0
+                        # Fallback: usa forecast intraday_dinamico ma normalizza correttamente
+                        df_giorno = fascia_df[fascia_df['GG_SETT'] == giorno].copy()
+                        if len(df_giorno) > 0:
+                            pattern_fascia = df_giorno.groupby(['FASCIA', 'MINUTI'])['FORECAST'].mean().reset_index()
+                            pattern_fascia = pattern_fascia.sort_values('MINUTI')
+                            pattern_fascia.rename(columns={'FORECAST': 'OFFERTO'}, inplace=True)
 
-                    # Rinomina FORECAST in OFFERTO per compatibilità con _distribuisci_forecast_per_fascia
-                    pattern_fascia.rename(columns={'FORECAST': 'OFFERTO'}, inplace=True)
-                    pattern_intraday[giorno] = pattern_fascia
+                            totale_giorno = pattern_fascia['OFFERTO'].sum()
+                            if totale_giorno > 0:
+                                pattern_fascia['PERCENTUALE'] = pattern_fascia['OFFERTO'] / totale_giorno
+                            else:
+                                pattern_fascia['PERCENTUALE'] = 1.0 / len(pattern_fascia)
+
+                            pattern_intraday[giorno] = pattern_fascia
 
                 if produce_outputs:
                     print(f"      Pattern intraday costruito: {len(pattern_intraday)} giorni")
+
+                # Normalizza pattern per garantire sum(PERCENTUALE) = 1.0
+                pattern_intraday = _validate_and_normalize_percentages(pattern_intraday)
 
                 forecast_fascia_df = _distribuisci_forecast_per_fascia(pattern_intraday, forecast_daily_df)
                 if produce_outputs:
@@ -3023,71 +4104,318 @@ def _forecast_ensemble_hybrid(df, tutti_forecast, backtest_metrics, giorni_forec
         return None
 
 
-def _correggi_forecast_con_storico(forecast_df, df_storico, soglia_minima=5):
+def _rileva_festivita_automatiche(forecast_dates, df_storico, soglia_chiusura=5):
     """
-    Corregge il forecast basandosi sui pattern storici degli stessi giorni dell'anno.
+    Rileva automaticamente le festività italiane nel periodo di forecast e determina
+    i fattori di correzione basandosi sullo storico.
 
-    Se nello storico un certo giorno/mese (es. 1 novembre) aveva SEMPRE volume molto basso
-    (< soglia_minima), allora anche il forecast per quel giorno viene azzerato.
+    Args:
+        forecast_dates: lista/Series di date del forecast
+        df_storico: DataFrame storico con colonne ['DATA', 'OFFERTO']
+        soglia_chiusura: soglia sotto cui considerare il giorno "chiuso"
+
+    Returns:
+        dict con:
+            - 'festivita_rilevate': lista delle festività rilevate
+            - 'correzioni': dict {data: {'festivita': nome, 'fattore': 0.0-1.0, 'valore_storico': float|None}}
+    """
+    try:
+        import holidays
+    except ImportError:
+        print("   ⚠️ Libreria 'holidays' non disponibile, rilevazione automatica disabilitata")
+        return {'festivita_rilevate': [], 'correzioni': {}}
+
+    if not len(forecast_dates):
+        return {'festivita_rilevate': [], 'correzioni': {}}
+
+    # Determina l'intervallo di anni
+    forecast_dates = pd.Series(pd.to_datetime(forecast_dates))
+    anni_forecast = set(forecast_dates.dt.year)
+    anni_storico = set()
+    if df_storico is not None and 'DATA' in df_storico.columns:
+        anni_storico = set(pd.to_datetime(df_storico['DATA']).dt.year)
+
+    tutti_anni = anni_forecast.union(anni_storico)
+    anno_min, anno_max = min(tutti_anni), max(tutti_anni)
+
+    # Genera festività italiane ufficiali
+    it_holidays = holidays.Italy(years=range(anno_min, anno_max + 1))
+
+    # Definisci fattori di riduzione di default per tipo di festività
+    # (usati solo se non c'è storico disponibile)
+    fattori_default = {
+        'capodanno': 0.0,       # Chiuso
+        'epifania': 0.3,        # Ridotto
+        'pasqua': 0.0,          # Chiuso
+        'lunedi': 0.0,          # Lunedì dell'Angelo - Chiuso
+        'liberazione': 0.2,     # 25 aprile - Ridotto
+        'lavoro': 0.0,          # 1 maggio - Chiuso
+        'repubblica': 0.3,      # 2 giugno - Ridotto
+        'ferragosto': 0.0,      # Chiuso
+        'ognissanti': 0.2,      # Ridotto
+        'immacolata': 0.3,      # Ridotto
+        'natale': 0.0,          # Chiuso
+        'santo stefano': 0.0,   # Chiuso
+    }
+
+    # Prepara storico giornaliero
+    storico_giornaliero = None
+    if df_storico is not None and not df_storico.empty:
+        storico_giornaliero = df_storico.groupby('DATA')['OFFERTO'].sum().reset_index()
+        storico_giornaliero['DATA'] = pd.to_datetime(storico_giornaliero['DATA'])
+
+    festivita_rilevate = []
+    correzioni = {}
+
+    for data in forecast_dates:
+        data_ts = pd.Timestamp(data)
+
+        # Verifica se è una festività italiana
+        if data_ts.date() in it_holidays:
+            nome_festivita = it_holidays.get(data_ts.date())
+            festivita_rilevate.append({'data': data_ts, 'festivita': nome_festivita})
+
+            # Cerca lo storico per questa specifica festività
+            valore_storico = None
+            fattore = None
+
+            if storico_giornaliero is not None:
+                # Cerca la stessa festività negli anni precedenti
+                for anno_prec in sorted(anni_storico, reverse=True):
+                    try:
+                        data_storica = data_ts.replace(year=anno_prec)
+                        if data_storica.date() in it_holidays:
+                            # Verifica che sia la stessa festività
+                            nome_storico = it_holidays.get(data_storica.date())
+                            if nome_storico == nome_festivita:
+                                match = storico_giornaliero[storico_giornaliero['DATA'] == data_storica]
+                                if not match.empty:
+                                    valore_storico = match['OFFERTO'].iloc[0]
+                                    break
+                    except ValueError:
+                        # Data non valida (es. 29/02 in anno non bisestile)
+                        continue
+
+            # Determina il fattore di correzione
+            if valore_storico is not None:
+                # Usa il valore storico direttamente
+                if valore_storico <= soglia_chiusura:
+                    fattore = 0.0  # Chiusura
+                else:
+                    # Calcola fattore rispetto alla media storica del giorno della settimana
+                    dow = data_ts.dayofweek
+                    if storico_giornaliero is not None:
+                        media_dow = storico_giornaliero[
+                            storico_giornaliero['DATA'].dt.dayofweek == dow
+                        ]['OFFERTO'].mean()
+                        if media_dow > 0:
+                            fattore = min(1.0, valore_storico / media_dow)
+                        else:
+                            fattore = 1.0
+                    else:
+                        fattore = 1.0
+            else:
+                # Usa fattore di default basato sul tipo di festività
+                nome_lower = nome_festivita.lower()
+                for chiave, fatt in fattori_default.items():
+                    if chiave in nome_lower:
+                        fattore = fatt
+                        break
+                if fattore is None:
+                    fattore = 0.5  # Default generico per festività non riconosciute
+
+            correzioni[data_ts] = {
+                'festivita': nome_festivita,
+                'fattore': fattore,
+                'valore_storico': valore_storico
+            }
+
+    return {
+        'festivita_rilevate': festivita_rilevate,
+        'correzioni': correzioni
+    }
+
+
+def _normalizza_nome_festivita(nome):
+    if not isinstance(nome, str):
+        return ""
+    return nome.strip().lower().replace(" ", "_")
+
+
+def _correggi_forecast_con_storico(forecast_df, df_storico, soglia_minima=5, festivita_selezionate=None, auto_festivi=None):
+    """
+    Corregge il forecast usando storico.
+
+    - Se auto_festivi=True (o AUTO_FESTIVI globale), rileva automaticamente le festività
+      italiane nel periodo di forecast e applica correzioni basate sullo storico o su fattori di default.
+    - Se festivita_selezionate e' valorizzato, applica ai giorni festivi selezionati
+      la media storica di quelle festivita'.
+    - Applica una correzione settimanale: se un giorno della settimana ha media sotto
+      soglia_minima e almeno il 90% di valori <= soglia_minima, viene azzerato.
 
     Args:
         forecast_df: DataFrame con colonne ['DATA', 'FORECAST', ...]
         df_storico: DataFrame storico originale con colonne ['DATA', 'OFFERTO']
         soglia_minima: soglia sotto cui considerare il giorno "chiuso" (default: 5 chiamate)
+        festivita_selezionate: lista di festivita' da correggere usando la media storica
+        auto_festivi: se True, rileva e corregge automaticamente le festività
+                      (default: usa variabile globale AUTO_FESTIVI)
 
     Returns:
         DataFrame forecast corretto
     """
-    # Aggrega storico per giorno
-    daily_storico = df_storico.groupby('DATA')['OFFERTO'].sum().reset_index()
+    # Usa il valore globale se non specificato esplicitamente
+    if auto_festivi is None:
+        auto_festivi = AUTO_FESTIVI
 
-    # Per ogni giorno nello storico, estrai mese/giorno
-    daily_storico['MESE_GIORNO'] = daily_storico['DATA'].dt.strftime('%m-%d')
-
-    # Identifica giorni che sono SEMPRE stati chiusi/quasi chiusi (< soglia)
-    giorni_chiusi = daily_storico.groupby('MESE_GIORNO').agg({
-        'OFFERTO': ['count', 'mean', 'max']
-    }).reset_index()
-    giorni_chiusi.columns = ['MESE_GIORNO', 'occorrenze', 'media', 'massimo']
-
-    # Un giorno è "chiuso" se:
-    # - La media è < soglia_minima E
-    # - Il massimo storico è < soglia_minima * 2 (per evitare falsi positivi)
-    # - Ha almeno 1 occorrenza nello storico
-    giorni_da_azzerare = giorni_chiusi[
-        (giorni_chiusi['media'] < soglia_minima) &
-        (giorni_chiusi['massimo'] < soglia_minima * 2) &
-        (giorni_chiusi['occorrenze'] >= 1)
-    ]['MESE_GIORNO'].tolist()
-
-    if not giorni_da_azzerare:
-        return forecast_df  # Nessuna correzione necessaria
-
-    # Applica correzione al forecast
     forecast_corretto = forecast_df.copy()
-    forecast_corretto['MESE_GIORNO'] = forecast_corretto['DATA'].dt.strftime('%m-%d')
+    if forecast_corretto.empty or df_storico.empty:
+        return forecast_df
 
-    mask_azzerare = forecast_corretto['MESE_GIORNO'].isin(giorni_da_azzerare)
-    n_giorni_azzerati = mask_azzerare.sum()
+    forecast_corretto['OVERRIDE_FESTIVO'] = False
 
-    if n_giorni_azzerati > 0:
-        # Azzera la colonna FORECAST
-        forecast_corretto.loc[mask_azzerare, 'FORECAST'] = 0
+    # ✨ NUOVO: Rilevazione e correzione automatica delle festività
+    if auto_festivi and not festivita_selezionate:
+        try:
+            rilevazione = _rileva_festivita_automatiche(
+                forecast_corretto['DATA'],
+                df_storico,
+                soglia_chiusura=soglia_minima
+            )
 
-        # Azzera anche CI_LOWER e CI_UPPER se presenti
-        if 'CI_LOWER' in forecast_corretto.columns:
-            forecast_corretto.loc[mask_azzerare, 'CI_LOWER'] = 0
-        if 'CI_UPPER' in forecast_corretto.columns:
-            forecast_corretto.loc[mask_azzerare, 'CI_UPPER'] = 0
+            if rilevazione['festivita_rilevate']:
+                n_festivita = len(rilevazione['festivita_rilevate'])
+                print(f"   🎄 Festività rilevate automaticamente: {n_festivita}")
 
-        print(f"   🔧 Corretti {n_giorni_azzerati} giorni di forecast basandosi su pattern storico")
-        print(f"      Giorni azzerati: {', '.join(sorted(set(forecast_corretto[mask_azzerare]['DATA'].dt.strftime('%d/%m'))))}")
+                correzioni_applicate = 0
+                for data, info in rilevazione['correzioni'].items():
+                    mask = forecast_corretto['DATA'] == data
+                    if mask.any():
+                        forecast_orig = forecast_corretto.loc[mask, 'FORECAST'].iloc[0]
 
-    # Rimuovi colonna temporanea
-    forecast_corretto = forecast_corretto.drop(columns=['MESE_GIORNO'])
+                        if info['valore_storico'] is not None:
+                            # Usa il valore storico direttamente
+                            nuovo_valore = info['valore_storico']
+                            print(f"      {data.strftime('%d/%m/%Y')} ({info['festivita']}): "
+                                  f"{forecast_orig:.0f} → {nuovo_valore:.0f} (storico)")
+                        else:
+                            # Applica il fattore di riduzione
+                            nuovo_valore = forecast_orig * info['fattore']
+                            if info['fattore'] == 0:
+                                print(f"      {data.strftime('%d/%m/%Y')} ({info['festivita']}): "
+                                      f"{forecast_orig:.0f} → 0 (chiusura stimata)")
+                            else:
+                                print(f"      {data.strftime('%d/%m/%Y')} ({info['festivita']}): "
+                                      f"{forecast_orig:.0f} → {nuovo_valore:.0f} (fattore {info['fattore']:.0%})")
+
+                        forecast_corretto.loc[mask, 'FORECAST'] = nuovo_valore
+                        if 'CI_LOWER' in forecast_corretto.columns:
+                            forecast_corretto.loc[mask, 'CI_LOWER'] = nuovo_valore * 0.8
+                        if 'CI_UPPER' in forecast_corretto.columns:
+                            forecast_corretto.loc[mask, 'CI_UPPER'] = nuovo_valore * 1.2
+                        forecast_corretto.loc[mask, 'OVERRIDE_FESTIVO'] = True
+                        correzioni_applicate += 1
+
+                if correzioni_applicate > 0:
+                    print(f"   ✅ Correzioni festività applicate: {correzioni_applicate}")
+
+        except Exception as e:
+            print(f"   ⚠️ Errore rilevazione automatica festività: {e}")
+
+    if festivita_selezionate:
+        anno_min = min(df_storico['DATA'].min().year, forecast_corretto['DATA'].min().year)
+        anno_max = max(df_storico['DATA'].max().year, forecast_corretto['DATA'].max().year)
+        festivita = _genera_festivita_italiane(anno_min, anno_max)
+        if not festivita.empty:
+            festivita = festivita.copy()
+            festivita['holiday_norm'] = festivita['holiday'].apply(_normalizza_nome_festivita)
+            selezionate_norm = {_normalizza_nome_festivita(h) for h in festivita_selezionate if h}
+            festivita = festivita[festivita['holiday_norm'].isin(selezionate_norm)]
+            if not festivita.empty:
+                daily_storico = df_storico.groupby('DATA')['OFFERTO'].sum().reset_index()
+                storico_festivi = daily_storico.merge(
+                    festivita[['ds', 'holiday_norm']],
+                    left_on='DATA',
+                    right_on='ds',
+                    how='inner'
+                )
+                if not storico_festivi.empty:
+                    stats_festivi = storico_festivi.groupby('holiday_norm')['OFFERTO'].agg(['count', 'mean']).reset_index()
+                    media_festivi = stats_festivi.set_index('holiday_norm')['mean']
+
+                    forecast_corretto = forecast_corretto.merge(
+                        festivita[['ds', 'holiday_norm']],
+                        left_on='DATA',
+                        right_on='ds',
+                        how='left'
+                    )
+                    override = forecast_corretto['holiday_norm'].map(media_festivi)
+                    mask_override = override.notna()
+                    n_override = int(mask_override.sum())
+                    if n_override > 0:
+                        forecast_corretto.loc[mask_override, 'FORECAST'] = override[mask_override].values
+                        if 'CI_LOWER' in forecast_corretto.columns:
+                            forecast_corretto.loc[mask_override, 'CI_LOWER'] = override[mask_override].values
+                        if 'CI_UPPER' in forecast_corretto.columns:
+                            forecast_corretto.loc[mask_override, 'CI_UPPER'] = override[mask_override].values
+                        forecast_corretto.loc[mask_override, 'OVERRIDE_FESTIVO'] = True
+
+                        giorni_override = forecast_corretto.loc[mask_override, 'DATA'].dt.strftime('%d/%m').tolist()
+                        festivita_usate = sorted(set(forecast_corretto.loc[mask_override, 'holiday_norm']))
+                        print(f"   Correzione festivi: {n_override} giorni aggiornati su storico")
+                        print(f"      Festivita': {', '.join(festivita_usate)}")
+                        print(f"      Giorni: {', '.join(sorted(set(giorni_override)))}")
+
+                    forecast_corretto = forecast_corretto.drop(columns=['ds', 'holiday_norm'], errors='ignore')
+
+    daily_storico = df_storico.groupby('DATA')['OFFERTO'].sum().reset_index()
+    daily_storico['DOW'] = daily_storico['DATA'].dt.dayofweek
+    daily_storico['IS_LOW'] = daily_storico['OFFERTO'] <= soglia_minima
+
+    stats_dow = daily_storico.groupby('DOW').agg(
+        occorrenze=('OFFERTO', 'count'),
+        media=('OFFERTO', 'mean'),
+        massimo=('OFFERTO', 'max'),
+        low_rate=('IS_LOW', 'mean')
+    ).reset_index()
+
+    soglia_low_rate = 0.9
+    giorni_chiusi = stats_dow[
+        (stats_dow['media'] < soglia_minima) &
+        (stats_dow['low_rate'] >= soglia_low_rate) &
+        (stats_dow['occorrenze'] >= 1)
+    ]['DOW'].tolist()
+
+    if giorni_chiusi:
+        forecast_corretto['DOW'] = forecast_corretto['DATA'].dt.dayofweek
+        mask_azzerare = forecast_corretto['DOW'].isin(giorni_chiusi)
+        if 'OVERRIDE_FESTIVO' in forecast_corretto.columns:
+            mask_azzerare = mask_azzerare & (~forecast_corretto['OVERRIDE_FESTIVO'])
+
+        n_giorni_azzerati = int(mask_azzerare.sum())
+        if n_giorni_azzerati > 0:
+            forecast_corretto.loc[mask_azzerare, 'FORECAST'] = 0
+            if 'CI_LOWER' in forecast_corretto.columns:
+                forecast_corretto.loc[mask_azzerare, 'CI_LOWER'] = 0
+            if 'CI_UPPER' in forecast_corretto.columns:
+                forecast_corretto.loc[mask_azzerare, 'CI_UPPER'] = 0
+
+            nomi_dow = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+            giorni_nome = [nomi_dow[d] for d in sorted(set(giorni_chiusi))]
+            print(f"   Correzione settimanale: {n_giorni_azzerati} giorni azzerati")
+            print(f"      Giorni chiusi: {', '.join(giorni_nome)}")
+
+    # Apply weekday ratio correction to align forecast with historical patterns
+    # This fixes issues where models overestimate certain weekdays (e.g., Saturday)
+    forecast_corretto = _apply_weekday_ratio_correction(
+        forecast_corretto,
+        df_storico,
+        correction_strength=0.8
+    )
+
+    forecast_corretto = forecast_corretto.drop(columns=['DOW', 'OVERRIDE_FESTIVO'], errors='ignore')
 
     return forecast_corretto
-
 
 def genera_forecast_modelli(df, output_dir, giorni_forecast=28, metodi=None, escludi_festivita=None, fast_mode=False):
     """
@@ -3105,9 +4433,9 @@ def genera_forecast_modelli(df, output_dir, giorni_forecast=28, metodi=None, esc
         print("   ⚡ Modalita veloce (fast mode): eseguo solo modelli rapidi e TBATS senza grafici")
     if metodi is None:
         if fast_mode:
-            metodi = ('holtwinters', 'naive', 'pattern', 'intraday_dinamico')
+            metodi = ('holtwinters', 'naive', 'pattern', 'intraday_dinamico', 'ensemble_hybrid')
         else:
-            metodi = ('holtwinters', 'pattern', 'naive', 'sarima', 'prophet', 'tbats', 'intraday_dinamico')
+            metodi = ('holtwinters', 'pattern', 'naive', 'sarima', 'prophet', 'tbats', 'intraday_dinamico', 'ensemble_hybrid')
 
     risultati = {}
     confronto_frames = []
@@ -3122,40 +4450,22 @@ def genera_forecast_modelli(df, output_dir, giorni_forecast=28, metodi=None, esc
                 risultati[metodo] = _forecast_holtwinters(df, output_dir, giorni_forecast, produce_outputs=True)
             elif metodo == 'pattern':
                 risultati[metodo] = _forecast_pattern_based(df, giorni_forecast)
-                if risultati[metodo] is not None:
-                    actual_path = _salva_forecast_excel(output_dir, 'forecast_pattern.xlsx', risultati[metodo])
-                    print(f"   Forecast pattern salvato: {actual_path.name}")
             elif metodo == 'naive':
                 risultati[metodo] = _forecast_naive_baseline(df, giorni_forecast)
-                if risultati[metodo] is not None:
-                    actual_path = _salva_forecast_excel(output_dir, 'forecast_naive.xlsx', risultati[metodo])
-                    print(f"   Forecast naive salvato: {actual_path.name}")
             elif metodo == 'sarima':
                 risultati[metodo] = _forecast_sarima(df, giorni_forecast, produce_outputs=False)
-                if risultati[metodo] is not None:
-                    actual_path = _salva_forecast_excel(output_dir, 'forecast_sarima.xlsx', risultati[metodo])
-                    print(f"   Forecast SARIMA salvato: {actual_path.name}")
             elif metodo == 'prophet':
                 risultati[metodo] = _forecast_prophet(df, giorni_forecast, produce_outputs=False, escludi_festivita=escludi_festivita)
-                if risultati[metodo] is not None:
-                    actual_path = _salva_forecast_excel(output_dir, 'forecast_prophet.xlsx', risultati[metodo])
-                    print(f"   Forecast Prophet salvato: {actual_path.name}")
             elif metodo == 'tbats':
                 print(f"   Avvio TBATS...")
                 risultati[metodo] = _forecast_tbats(df, giorni_forecast, produce_outputs=not fast_mode)
-                if risultati[metodo] is not None:
-                    actual_path = _salva_forecast_excel(output_dir, 'forecast_tbats.xlsx', risultati[metodo])
-                    print(f"   ✅ Forecast TBATS salvato: {actual_path.name}")
-                else:
+                if risultati[metodo] is None:
                     detail = "TBATS non generato (dipendenze o dati insufficienti)"
                     print(f"   ⚠️  Forecast TBATS non generato (verifica messaggi sopra)")
             elif metodo == 'intraday_dinamico':
                 print(f"   Avvio Forecast Intraday Dinamico...")
                 risultati[metodo] = _forecast_intraday_dinamico(df, giorni_forecast, produce_outputs=True)
-                if risultati[metodo] is not None:
-                    actual_path = _salva_forecast_excel(output_dir, 'forecast_intraday_dinamico.xlsx', risultati[metodo])
-                    print(f"   ✅ Forecast Intraday Dinamico salvato: {actual_path.name}")
-                else:
+                if risultati[metodo] is None:
                     detail = "Intraday dinamico non disponibile (dipendenze o dati insufficienti)"
                     print(f"   ⚠️  Forecast Intraday Dinamico non generato (verifica messaggi sopra)")
             elif metodo == 'ensemble_hybrid' or metodo == 'hybrid':
@@ -3176,8 +4486,22 @@ def genera_forecast_modelli(df, output_dir, giorni_forecast=28, metodi=None, esc
                 result['giornaliero'] = _correggi_forecast_con_storico(
                     result['giornaliero'],
                     df,
-                    soglia_minima=5
+                    soglia_minima=5,
+                    festivita_selezionate=escludi_festivita
                 )
+
+                # ✨ Applica regressori esterni se disponibili
+                result['giornaliero'] = applica_regressori_a_forecast(result['giornaliero'])
+
+                # IMPORTANTE: Salva Excel DOPO la correzione settimanale
+                nome_file_excel = f'forecast_{metodo}.xlsx'
+                actual_path = _salva_forecast_excel(output_dir, nome_file_excel, result)
+                if metodo in ['pattern', 'naive', 'sarima', 'prophet']:
+                    print(f"   Forecast {metodo} salvato: {actual_path.name}")
+                elif metodo == 'tbats':
+                    print(f"   ✅ Forecast TBATS salvato: {actual_path.name}")
+                elif metodo == 'intraday_dinamico':
+                    print(f"   ✅ Forecast Intraday Dinamico salvato: {actual_path.name}")
 
                 daily_df = result['giornaliero'][['DATA', 'FORECAST']].copy()
                 daily_df.rename(columns={'FORECAST': metodo}, inplace=True)
@@ -3236,6 +4560,19 @@ def genera_forecast_modelli(df, output_dir, giorni_forecast=28, metodi=None, esc
 
             if hybrid_result is not None:
                 print(f"   ✅ Ensemble Hybrid generato con successo!")
+
+                # ✨ CRITICAL: Apply correction to ensemble_hybrid just like other models
+                hybrid_result['giornaliero'] = _correggi_forecast_con_storico(
+                    hybrid_result['giornaliero'],
+                    df,
+                    soglia_minima=5,
+                    festivita_selezionate=escludi_festivita
+                )
+                print(f"   ✅ Correzione storica applicata al forecast Ensemble Hybrid")
+
+                # ✨ Applica regressori esterni se disponibili
+                hybrid_result['giornaliero'] = applica_regressori_a_forecast(hybrid_result['giornaliero'])
+
                 risultati['ensemble_hybrid'] = hybrid_result
 
                 # Aggiungi al confronto
@@ -3898,7 +5235,7 @@ AFFIDABILITÀ (MAPE): {affidabilita_text} {affidabilita_label}
 
         # Distribuzione giorni settimana (da storico)
         if 'GG SETT' in df.columns:
-            gg_dist = df.groupby('GG SETT')['OFFERTO'].mean().reindex(['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom'])
+            gg_dist = df.groupby('GG SETT')['OFFERTO'].mean().reindex(['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom', 'fest'])
             ax2.bar(gg_dist.index, gg_dist.values, color='#A23B72', alpha=0.7)
             ax2.set_title('Pattern Settimanale (Media Storica)', fontsize=12, fontweight='bold')
             ax2.set_ylabel('Chiamate Medie')
@@ -3939,70 +5276,93 @@ def processa_singolo_file(file_path, output_dir, giorni_forecast=28, escludi_fes
         print(f"Giorni forecast: {giorni_forecast}")
         print()
 
-        print("\n[1/16] Caricamento dati...")
+        print("\n[1/20] Caricamento dati...")
         t_step = time.time()
         df = carica_dati(file_path)
         _log_step_time("Caricamento dati", t_step)
 
-        print("\n[2/16] Analisi fascia oraria...")
+        print("\n[2/20] Analisi fascia oraria...")
         t_step = time.time()
         fascia_stats = analisi_fascia_oraria(df, output_dir)
         _log_step_time("Analisi fascia oraria", t_step)
 
-        print("\n[3/16] Analisi giorno settimana...")
+        print("\n[3/20] Analisi giorno settimana...")
         t_step = time.time()
         giorno_stats = analisi_giorno_settimana(df, output_dir)
         _log_step_time("Analisi giorno settimana", t_step)
 
-        print("\n[4/16] Analisi settimana...")
+        print("\n[4/20] Analisi settimana...")
         t_step = time.time()
         week_stats = analisi_settimana(df, output_dir)
         _log_step_time("Analisi settimana", t_step)
 
-        print("\n[5/16] Analisi mese...")
+        print("\n[5/20] Analisi mese...")
         t_step = time.time()
         mese_stats = analisi_mese(df, output_dir)
         _log_step_time("Analisi mese", t_step)
 
-        print("\n[6/16] Heatmap...")
+        print("\n[6/20] Heatmap...")
         t_step = time.time()
         crea_heatmap(df, output_dir)
         _log_step_time("Heatmap", t_step)
 
-        print("\n[7/16] Curve previsionali...")
+        print("\n[7/20] Curve previsionali...")
         t_step = time.time()
         curve = genera_curve_previsionali(df, output_dir)
         _log_step_time("Curve previsionali", t_step)
 
-        print("\n[8/16] Trend storico...")
+        print("\n[8/20] Trend storico...")
         t_step = time.time()
         daily_trend = analisi_consuntiva_trend(df, output_dir)
         _log_step_time("Trend storico", t_step)
 
-        print("\n[9/16] Confronto periodi...")
+        print("\n[9/20] Confronto periodi...")
         t_step = time.time()
         week_comp, month_comp = analisi_confronto_periodi(df, output_dir)
         _log_step_time("Confronto periodi", t_step)
 
-        print("\n[10/16] Anomalie...")
+        print("\n[10/17] Anomalie...")
         t_step = time.time()
         anomalie_alte, anomalie_basse = identifica_anomalie(df, output_dir)
         _log_step_time("Anomalie", t_step)
 
-        print("\n[11/16] KPI...")
+        # Pulizia anomalie se abilitata
+        df_forecast = df  # Default: usa df originale
+        if PULISCI_ANOMALIE:
+            print("\n[11/17] Pulizia anomalie storico...")
+            t_step = time.time()
+            metodo = METODO_PULIZIA_ANOMALIE
+            risultato_pulizia = pulisci_storico_anomalie(df, metodo=metodo, soglia_std=2.5, verbose=True)
+            if risultato_pulizia['n_corrette'] > 0:
+                df_forecast = risultato_pulizia['df_pulito']
+                print(f"   📊 Dataset per forecast: {len(df_forecast)} righe (pulito)")
+            _log_step_time("Pulizia anomalie", t_step)
+        else:
+            print("\n[11/20] Pulizia anomalie: SKIP (disabilitata)")
+
+        # Carica regressori esterni se disponibili
+        print("\n[12/20] Caricamento regressori esterni...")
+        t_step = time.time()
+        regressori = carica_regressori_esterni()
+        if regressori['n_eventi'] > 0:
+            _log_step_time("Caricamento regressori", t_step)
+        else:
+            print("   ℹ️ Nessun file eventi_esterni.xlsx trovato (opzionale)")
+
+        print("\n[13/20] KPI...")
         t_step = time.time()
         kpi = dashboard_kpi_consuntivi(df, output_dir)
         _log_step_time("KPI", t_step)
 
-        print("\n[12/16] Valutazione forecast (backtest Holt-Winters)...")
+        print("\n[14/20] Valutazione forecast (backtest Holt-Winters)...")
         t_step = time.time()
-        valutazione = valuta_modelli_forecast(df, output_dir, giorni_forecast=giorni_forecast, fast_mode=FAST_MODE)
+        valutazione = valuta_modelli_forecast(df_forecast, output_dir, giorni_forecast=giorni_forecast, fast_mode=FAST_MODE)
         _log_step_time("Valutazione forecast", t_step)
 
-        print("\n[13/16] Forecast multi-modello...")
+        print("\n[15/20] Forecast multi-modello...")
         t_step = time.time()
         forecast_modelli = genera_forecast_modelli(
-            df,
+            df_forecast,  # Usa dati puliti se pulizia abilitata
             output_dir,
             giorni_forecast=giorni_forecast,
             metodi=metodi,
@@ -4013,38 +5373,46 @@ def processa_singolo_file(file_path, output_dir, giorni_forecast=28, escludi_fes
         forecast_completo = forecast_modelli.get('holtwinters')
         if forecast_completo is None:
             # usa il primo disponibile come fallback per i passi successivi
-            forecast_completo = next(iter(forecast_modelli.values()))
+            modelli_validi = {k: v for k, v in forecast_modelli.items() if v is not None}
+            if modelli_validi:
+                forecast_completo = next(iter(modelli_validi.values()))
+            else:
+                print("   ⚠️ Nessun modello ha prodotto risultati validi!")
+                forecast_completo = None
 
-        print("\n[14/16] Report statistico...")
+        print("\n[16/20] Report statistico...")
         t_step = time.time()
         genera_report_statistico(df, fascia_stats, giorno_stats, week_stats, mese_stats, week_comp, month_comp, anomalie_alte, anomalie_basse, kpi, output_dir)
         _log_step_time("Report statistico", t_step)
 
-        print("\n[15/16] Dashboard Excel...")
+        print("\n[17/20] Dashboard Excel...")
         t_step = time.time()
-        excel_path = crea_dashboard_excel(df, fascia_stats, giorno_stats, week_stats, mese_stats, curve, forecast_completo['giornaliero'], kpi, output_dir)
+        forecast_giornaliero_data = forecast_completo['giornaliero'] if forecast_completo else pd.DataFrame()
+        excel_path = crea_dashboard_excel(df, fascia_stats, giorno_stats, week_stats, mese_stats, curve, forecast_giornaliero_data, kpi, output_dir)
         _log_step_time("Dashboard Excel", t_step)
 
-        print("\n[16/19] Report finale...")
+        print("\n[18/20] Report finale...")
         t_step = time.time()
-        genera_report_finale(df, kpi, forecast_completo['giornaliero'], output_dir)
+        if forecast_completo:
+            genera_report_finale(df, kpi, forecast_completo['giornaliero'], output_dir)
+        else:
+            print("   ⚠️ Nessun forecast disponibile, report finale saltato")
         _log_step_time("Report finale", t_step)
 
-        # [17/19] Alert automatici
-        print("\n[17/19] Alert automatici...")
+        # Alert automatici
+        print("\n[19/20] Alert automatici...")
         t_step = time.time()
         forecast_giornaliero = forecast_completo.get('giornaliero') if forecast_completo else None
         alerts = _rileva_alert(df, forecast_giornaliero, forecast_modelli.get('backtest'), output_dir) if forecast_giornaliero is not None else []
         _log_step_time("Alert automatici", t_step)
 
-        # [18/19] Report PDF esecutivo
-        print("\n[18/19] Report PDF esecutivo...")
+        # Report PDF esecutivo + Pipeline completata
+        print("\n[20/20] Report PDF esecutivo e finalizzazione...")
         t_step = time.time()
         pdf_path = _genera_report_pdf(df, forecast_modelli, forecast_modelli.get('backtest'), kpi, output_dir)
         _log_step_time("Report PDF esecutivo", t_step)
 
-        # [19/19] Pipeline completata
-        print("\n[19/19] Pipeline completata (confronto consuntivo disponibile su richiesta GUI)")
+        print("\n✅ Pipeline completata (confronto consuntivo disponibile su richiesta GUI)")
 
         print("\n" + "=" * 80)
         print("✅ FILE COMPLETATO!")
@@ -4121,7 +5489,7 @@ def main(giorni_forecast=28, escludi_festivita=None, input_dirs=None, metodi=Non
     
     print(f"Avvio elaborazione parallela con {max_workers} processi...")
     
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_dir = str(_get_app_dir())
     risultati = []
 
     # OTTIMIZZAZIONE: Se c'è solo un file, evita l'overhead del multiprocessing
@@ -4135,8 +5503,11 @@ def main(giorni_forecast=28, escludi_festivita=None, input_dirs=None, metodi=Non
         )
         risultati.append(res)
     else:
-        print(f"Avvio elaborazione parallela con {max_workers} processi...")
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Usa ThreadPoolExecutor invece di ProcessPoolExecutor per evitare
+        # finestre DOS lampeggianti su Windows con PyInstaller --noconsole
+        from concurrent.futures import ThreadPoolExecutor
+        print(f"Avvio elaborazione parallela con {max_workers} thread...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for file_path in file_excel_list:
                 file_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -4315,17 +5686,32 @@ class ForecastGUI:
         self.root.title("Forecast Call Center - GUI")
         self.root.geometry("960x700")
         self.root.configure(bg="#f7f7f7")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Carica valori di default dalla configurazione JSON
+        config_giorni = _get_config('forecast', 'giorni_forecast', 90)
+        config_fast = _get_config('modelli', 'fast_mode', FAST_MODE)
+        config_auto_festivi = _get_config('festivita', 'auto_correzione', AUTO_FESTIVI)
+        config_modelli = _get_config('modelli', 'abilitati', None)
+
+        script_dir = str(_get_app_dir())
         self.input_dir_var = tk.StringVar(value=script_dir)
-        self.forecast_days_var = tk.StringVar(value="90")
+        self.forecast_days_var = tk.StringVar(value=str(config_giorni))
         self.holidays_var = tk.StringVar(value="")
         self.best_model_var = tk.StringVar(value="N/D")
-        self.fast_mode_var = tk.BooleanVar(value=FAST_MODE)
+        self.fast_mode_var = tk.BooleanVar(value=config_fast)
+        self.auto_festivi_var = tk.BooleanVar(value=config_auto_festivi)
+        self.pulisci_anomalie_var = tk.BooleanVar(value=_get_config('anomalie', 'pulisci_storico', PULISCI_ANOMALIE))
+        self.metodo_pulizia_var = tk.StringVar(value=_get_config('anomalie', 'metodo_pulizia', METODO_PULIZIA_ANOMALIE))
+        self.usa_regressori_var = tk.BooleanVar(value=_get_config('regressori_esterni', 'abilitati', False))
+        self.file_regressori_var = tk.StringVar(value=_get_config('regressori_esterni', 'file_eventi', ''))
 
-        self.model_vars = {m: tk.BooleanVar(value=True) for m in (
-            'holtwinters', 'pattern', 'naive', 'sarima', 'prophet', 'tbats', 'intraday_dinamico', 'ensemble_hybrid'
-        )}
+        # Se config specifica i modelli, usa quelli come default
+        tutti_modelli = ['holtwinters', 'pattern', 'naive', 'sarima', 'prophet', 'tbats', 'intraday_dinamico', 'ensemble_hybrid']
+        if config_modelli:
+            self.model_vars = {m: tk.BooleanVar(value=(m in config_modelli)) for m in tutti_modelli}
+        else:
+            self.model_vars = {m: tk.BooleanVar(value=True) for m in tutti_modelli}
         self.holiday_flags_vars = {h: tk.BooleanVar(value=False) for h in HOLIDAY_FLAGS}
         self.confronto_df = None
         self.backtest_metrics = None
@@ -4411,6 +5797,13 @@ class ForecastGUI:
         flags_frame = ttk.Frame(form_frame)
         flags_frame.grid(row=3, column=0, columnspan=3, sticky="we", pady=2)
         ttk.Label(flags_frame, text="Flag rapidi festività da escludere:").grid(row=0, column=0, sticky="w")
+
+        # Bottoni seleziona tutto / pulisci
+        flags_buttons_frame = ttk.Frame(flags_frame)
+        flags_buttons_frame.grid(row=0, column=1, sticky="w", padx=20)
+        ttk.Button(flags_buttons_frame, text="Seleziona tutto", command=self._select_all_holidays, width=14).pack(side="left", padx=2)
+        ttk.Button(flags_buttons_frame, text="Pulisci", command=self._clear_all_holidays, width=8).pack(side="left", padx=2)
+
         for idx, holiday in enumerate(HOLIDAY_FLAGS):
             r = idx // 4 + 1
             c = idx % 4
@@ -4424,17 +5817,65 @@ class ForecastGUI:
             c = idx % 4
             ttk.Checkbutton(models_frame, text=modello, variable=self.model_vars[modello]).grid(row=r, column=c, sticky="w")
 
+        options_frame = ttk.Frame(form_frame)
+        options_frame.grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
+
         ttk.Checkbutton(
-            form_frame,
+            options_frame,
             text="Modalita veloce (--fast)",
             variable=self.fast_mode_var
-        ).grid(row=5, column=0, sticky="w")
+        ).grid(row=0, column=0, sticky="w", padx=(0, 20))
+
+        ttk.Checkbutton(
+            options_frame,
+            text="🎄 Correzione automatica festività",
+            variable=self.auto_festivi_var
+        ).grid(row=0, column=1, sticky="w", padx=(0, 20))
+
+        ttk.Checkbutton(
+            options_frame,
+            text="🧹 Pulisci anomalie storico",
+            variable=self.pulisci_anomalie_var
+        ).grid(row=0, column=2, sticky="w")
+
+        # Dropdown metodo pulizia anomalie
+        ttk.Label(options_frame, text="Metodo:").grid(row=0, column=3, sticky="w", padx=(10, 2))
+        self.metodo_pulizia_combo = ttk.Combobox(
+            options_frame,
+            textvariable=self.metodo_pulizia_var,
+            values=["interpolate", "media_dow", "escludi", "cap"],
+            state="readonly",
+            width=12
+        )
+        self.metodo_pulizia_combo.grid(row=0, column=4, sticky="w")
+
+        # Riga 2: Regressori esterni
+        ttk.Checkbutton(
+            options_frame,
+            text="📈 Usa regressori esterni",
+            variable=self.usa_regressori_var
+        ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(5, 0))
+
+        ttk.Entry(
+            options_frame,
+            textvariable=self.file_regressori_var,
+            width=40
+        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(5, 0))
+
+        ttk.Button(
+            options_frame,
+            text="Sfoglia",
+            command=self._browse_regressori
+        ).grid(row=1, column=3, sticky="w", padx=5, pady=(5, 0))
+
+        self.regressori_info_label = ttk.Label(options_frame, text="", foreground="gray")
+        self.regressori_info_label.grid(row=1, column=4, sticky="w", pady=(5, 0))
 
         self.run_button = ttk.Button(form_frame, text="Esegui forecast", command=self.run_analysis)
-        self.run_button.grid(row=5, column=0, pady=8, sticky="e")
+        self.run_button.grid(row=6, column=0, pady=8, sticky="e")
 
-        ttk.Label(form_frame, text="Miglior modello rilevato:").grid(row=5, column=1, sticky="e")
-        ttk.Label(form_frame, textvariable=self.best_model_var, font=("Helvetica", 10, "bold"), foreground="#2c7a7b").grid(row=5, column=2, sticky="w")
+        ttk.Label(form_frame, text="Miglior modello rilevato:").grid(row=6, column=1, sticky="e")
+        ttk.Label(form_frame, textvariable=self.best_model_var, font=("Helvetica", 10, "bold"), foreground="#2c7a7b").grid(row=6, column=2, sticky="w")
 
         form_frame.columnconfigure(1, weight=1)
 
@@ -4855,16 +6296,70 @@ class ForecastGUI:
 
         guide_text = ScrolledText(guide_scrollable, wrap=tk.WORD, height=20)
         guide_text.pack(fill="both", expand=True, padx=10, pady=10)
-        guide_text.insert(tk.END, """Guida rapida ai modelli disponibili:\n\n"
-                                 "- holtwinters: stagionalità settimanale, veloce e robusto.\n"
-                                 "- pattern: media delle stagionalità storiche, baseline semplice.\n"
-                                 "- naive: replica l'ultimo valore o media breve periodo, controllo qualità.\n"
-                                 "- sarima: trend + stagionalità con correlazione autoregressiva.\n"
-                                 "- prophet: stagionalità multiple e festività personalizzabili.\n"
-                                 "- tbats: multiple stagionalità complesse (richiede tbats).\n"
-                                 "- intraday_dinamico: distribuzione per fascia oraria, utile per staffing.\n"
-                                 "- ensemble_top2: media dei due modelli con MAPE più bassa.\n\n"
-                                 "Suggerimento: scegli i modelli dal pannello iniziale, escludi le festività non più valide e confronta le curve per giorno/settimana/mese insieme agli indici di affidabilità.""")
+        guide_content = """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    GUIDA RAPIDA AI MODELLI DI FORECAST                       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+📊 MODELLI DISPONIBILI:
+
+• HOLTWINTERS
+  Metodo di smoothing esponenziale con stagionalità settimanale.
+  ✅ Pro: Veloce, robusto, buono per dati con pattern regolari
+  ⚠️ Contro: Non gestisce bene trend non lineari
+
+• PATTERN
+  Media delle stagionalità storiche per giorno della settimana.
+  ✅ Pro: Semplice, interpretabile, baseline affidabile
+  ⚠️ Contro: Non cattura cambiamenti di trend
+
+• NAIVE
+  Replica l'ultimo valore o media di un breve periodo recente.
+  ✅ Pro: Utile come benchmark di controllo qualità
+  ⚠️ Contro: Non prevede realmente
+
+• SARIMA
+  Modello autoregressivo con trend e stagionalità.
+  ✅ Pro: Cattura correlazioni temporali complesse
+  ⚠️ Contro: Più lento, sensibile ai parametri
+
+• PROPHET (Facebook)
+  Modello additivo con stagionalità multiple e festività.
+  ✅ Pro: Gestisce festività, trend non lineari, dati mancanti
+  ⚠️ Contro: Richiede più dati storici
+
+• TBATS
+  Stagionalità multiple complesse (giornaliera + settimanale).
+  ✅ Pro: Ottimo per pattern complessi e multi-stagionali
+  ⚠️ Contro: Più lento, richiede libreria tbats
+
+• INTRADAY DINAMICO
+  Distribuzione per fascia oraria basata su pattern storici.
+  ✅ Pro: Ideale per pianificazione staffing
+  ⚠️ Contro: Richiede dati con granularità oraria
+
+• ENSEMBLE HYBRID
+  Combina i migliori modelli pesati per MAPE/SMAPE.
+  ✅ Pro: Spesso il più accurato, riduce varianza errori
+  ⚠️ Contro: Non interpretabile direttamente
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 SUGGERIMENTI:
+
+1. Inizia con holtwinters + prophet per avere un buon mix
+2. Usa ensemble_hybrid per la previsione finale
+3. Escludi festività che non sono più rilevanti
+4. Confronta le metriche MAPE e SMAPE nel tab "Confronti"
+5. Per staffing, usa intraday_dinamico con forecast giornaliero
+
+🎄 FESTIVITÀ: La correzione automatica rileva le festività italiane
+   e applica fattori di riduzione basati sullo storico.
+
+📈 REGRESSORI ESTERNI: Carica eventi speciali (campagne, scioperi)
+   dal file eventi_esterni.xlsx per migliorare le previsioni.
+"""
+        guide_text.insert(tk.END, guide_content)
         guide_text.configure(state='disabled')
 
         output_canvas, output_scrollable = self._create_scrollable_frame(tab_output)
@@ -4887,6 +6382,7 @@ class ForecastGUI:
         log_actions.pack(fill="x", padx=10)
         ttk.Button(log_actions, text="Cancella log", command=lambda: self.log_widget.delete("1.0", tk.END)).pack(side="left")
         ttk.Button(log_actions, text="Copia log", command=self._copy_log).pack(side="left", padx=(6, 0))
+        ttk.Button(log_actions, text="💾 Salva log", command=self._esporta_log).pack(side="left", padx=(6, 0))
         self.log_widget = ScrolledText(log_scrollable, height=18)
         self.log_widget.pack(fill="both", expand=True, padx=10, pady=6)
 
@@ -4915,15 +6411,92 @@ class ForecastGUI:
 
     def _apply_zoom(self):
         """Applica il livello di zoom corrente a tutti i widget"""
-        # This is a simplified implementation that updates font sizes
-        # For a complete implementation, we would need to traverse all widgets
-        # and update their fonts. For now, this provides the framework.
-        pass
+        # Calcola il fattore di scala (zoom_level va da -5 a +5)
+        scale_factor = 1.0 + (self.zoom_level * 0.1)  # Da 0.5x a 1.5x
+
+        # Dimensioni font base
+        base_sizes = {
+            'TLabel': 10,
+            'TButton': 10,
+            'TCheckbutton': 10,
+            'TEntry': 10,
+            'TCombobox': 10,
+            'TNotebook.Tab': 10,
+        }
+
+        style = ttk.Style()
+        for widget_type, base_size in base_sizes.items():
+            new_size = max(8, int(base_size * scale_factor))
+            try:
+                style.configure(widget_type, font=('TkDefaultFont', new_size))
+            except Exception:
+                pass
+
+        # Aggiorna anche il log widget se esiste
+        if self.log_widget:
+            log_size = max(8, int(10 * scale_factor))
+            try:
+                self.log_widget.configure(font=('Courier', log_size))
+            except Exception:
+                pass
+
+        # Mostra messaggio di zoom (opzionale)
+        zoom_percent = int(scale_factor * 100)
+        self.root.title(f"Forecast Call Center - GUI (Zoom: {zoom_percent}%)")
 
     def browse_input(self):
         path = filedialog.askdirectory(title="Seleziona cartella input")
         if path:
             self.input_dir_var.set(path)
+
+    def _browse_regressori(self):
+        """Apre dialog per selezionare il file eventi esterni."""
+        path = filedialog.askopenfilename(
+            title="Seleziona file eventi esterni",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        )
+        if path:
+            self.file_regressori_var.set(path)
+            self._update_regressori_info()
+
+    def _update_regressori_info(self):
+        """Aggiorna la label con info sul file regressori caricato."""
+        file_path = self.file_regressori_var.get()
+        if file_path and os.path.exists(file_path):
+            try:
+                df = pd.read_excel(file_path)
+                n_eventi = len(df)
+                self.regressori_info_label.config(text=f"({n_eventi} eventi)", foreground="green")
+            except Exception as e:
+                self.regressori_info_label.config(text=f"(Errore lettura)", foreground="red")
+        else:
+            self.regressori_info_label.config(text="", foreground="gray")
+
+    def _select_all_holidays(self):
+        """Seleziona tutte le festività."""
+        for var in self.holiday_flags_vars.values():
+            var.set(True)
+
+    def _clear_all_holidays(self):
+        """Deseleziona tutte le festività."""
+        for var in self.holiday_flags_vars.values():
+            var.set(False)
+
+    def _esporta_log(self):
+        """Esporta il log corrente in un file di testo."""
+        filepath = filedialog.asksaveasfilename(
+            title="Salva log come",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if filepath:
+            try:
+                content = self.log_widget.get("1.0", tk.END).strip()
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                messagebox.showinfo("Log salvato", f"Log salvato in:\n{filepath}")
+            except Exception as e:
+                messagebox.showerror("Errore salvataggio", str(e))
 
     def _copy_log(self):
         try:
@@ -4933,6 +6506,43 @@ class ForecastGUI:
             messagebox.showinfo("Log copiato", "Il log corrente è stato copiato negli appunti.")
         except Exception as exc:
             messagebox.showerror("Errore copia", str(exc))
+
+    def _salva_config(self):
+        """Salva le preferenze correnti nel file di configurazione JSON."""
+        try:
+            config = {
+                "forecast": {
+                    "giorni_forecast": int(self.forecast_days_var.get()) if self.forecast_days_var.get().isdigit() else 90
+                },
+                "modelli": {
+                    "fast_mode": self.fast_mode_var.get(),
+                    "abilitati": [k for k, v in self.model_vars.items() if v.get()]
+                },
+                "festivita": {
+                    "auto_correzione": self.auto_festivi_var.get()
+                },
+                "anomalie": {
+                    "pulisci_storico": self.pulisci_anomalie_var.get(),
+                    "metodo_pulizia": self.metodo_pulizia_var.get()
+                },
+                "regressori_esterni": {
+                    "abilitati": self.usa_regressori_var.get(),
+                    "file_eventi": self.file_regressori_var.get()
+                },
+                "soglie": {
+                    "chiusura": 5
+                }
+            }
+            config_path = _get_app_dir() / CONFIG_FILE
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Errore salvataggio config: {e}")
+
+    def _on_closing(self):
+        """Gestisce la chiusura della finestra salvando le preferenze."""
+        self._salva_config()
+        self.root.destroy()
 
     def _ensure_log_polling(self):
         """Mantiene attivo il polling della coda log in maniera resiliente."""
@@ -4982,10 +6592,21 @@ class ForecastGUI:
             self.root.after(1000, self._heartbeat_tick)
 
     def run_analysis(self):
+        # Validazione input
         try:
             giorni = int(self.forecast_days_var.get())
+            if giorni <= 0:
+                messagebox.showerror("Valore non valido", "Il numero di giorni deve essere maggiore di 0.")
+                return
+            if giorni > 365:
+                messagebox.showwarning("Attenzione", "Un forecast oltre 365 giorni potrebbe essere poco affidabile.")
         except ValueError:
             messagebox.showerror("Valore non valido", "Inserisci un numero di giorni intero.")
+            return
+
+        input_root = self.input_dir_var.get()
+        if not input_root or not os.path.exists(input_root):
+            messagebox.showerror("Cartella non valida", "La cartella input selezionata non esiste.\nSeleziona una cartella valida.")
             return
 
         holidays_list = [h.strip() for h in self.holidays_var.get().split(',') if h.strip()]
@@ -4995,7 +6616,13 @@ class ForecastGUI:
         if not selected_models:
             messagebox.showerror("Nessun modello selezionato", "Seleziona almeno un modello da eseguire.")
             return
-        input_root = self.input_dir_var.get()
+
+        # Validazione regressori esterni
+        usa_regressori = self.usa_regressori_var.get()
+        file_regressori = self.file_regressori_var.get()
+        if usa_regressori and file_regressori and not os.path.exists(file_regressori):
+            messagebox.showerror("File regressori non trovato", f"Il file regressori esterni non esiste:\n{file_regressori}")
+            return
 
         self.run_button.config(state="disabled")
         self.log_widget.delete("1.0", tk.END)
@@ -5009,21 +6636,40 @@ class ForecastGUI:
         self._start_log_polling()
         self._start_heartbeat()
 
-        self.log_widget.insert(tk.END, "Avvio elaborazione...\n")
-        self.log_widget.insert(tk.END, f"  Giorni forecast: {giorni}\n")
-        self.log_widget.insert(tk.END, f"  Modelli selezionati: {', '.join(selected_models)}\n")
-        if self.fast_mode_var.get():
-            self.log_widget.insert(tk.END, "  Modalita veloce (fast mode): ON (modelli leggeri e backtest ridotto)\n")
-        if holidays_list:
-            self.log_widget.insert(tk.END, f"  Festività escluse: {', '.join(holidays_list)}\n")
-        self.log_widget.insert(tk.END, "  Log in tempo reale qui sotto...\n\n")
-        self.log_widget.see(tk.END)
-
+        # Raccolta parametri
         fast_mode = bool(self.fast_mode_var.get())
+        auto_festivi = bool(self.auto_festivi_var.get())
+        pulisci_anomalie = bool(self.pulisci_anomalie_var.get())
+        metodo_pulizia = self.metodo_pulizia_var.get()
+
+        # Log configurazione completa con box
+        self.log_widget.insert(tk.END, "╔══════════════════════════════════════════════════════════════╗\n")
+        self.log_widget.insert(tk.END, "║              CONFIGURAZIONE FORECAST ATTIVA                  ║\n")
+        self.log_widget.insert(tk.END, "╠══════════════════════════════════════════════════════════════╣\n")
+        self.log_widget.insert(tk.END, f"║ Giorni forecast:      {giorni:<38} ║\n")
+        self.log_widget.insert(tk.END, f"║ Modelli:              {', '.join(selected_models):<38} ║\n")
+        self.log_widget.insert(tk.END, f"║ Fast mode:            {'ON (modelli leggeri)' if fast_mode else 'OFF':<38} ║\n")
+        self.log_widget.insert(tk.END, f"║ Auto festività:       {'ON' if auto_festivi else 'OFF':<38} ║\n")
+        self.log_widget.insert(tk.END, f"║ Pulizia anomalie:     {'ON (' + metodo_pulizia + ')' if pulisci_anomalie else 'OFF':<38} ║\n")
+        if usa_regressori and file_regressori:
+            n_eventi = "N/D"
+            try:
+                df_reg = pd.read_excel(file_regressori)
+                n_eventi = str(len(df_reg))
+            except:
+                pass
+            self.log_widget.insert(tk.END, f"║ Regressori esterni:   ON ({n_eventi} eventi){' ' * (36 - len(n_eventi) - 11)} ║\n")
+        else:
+            self.log_widget.insert(tk.END, f"║ Regressori esterni:   {'OFF':<38} ║\n")
+        if holidays_list:
+            hol_str = ', '.join(holidays_list[:3]) + ('...' if len(holidays_list) > 3 else '')
+            self.log_widget.insert(tk.END, f"║ Festività escluse:    {hol_str:<38} ║\n")
+        self.log_widget.insert(tk.END, "╚══════════════════════════════════════════════════════════════╝\n\n")
+        self.log_widget.see(tk.END)
 
         thread = threading.Thread(
             target=self._run_batch,
-            args=(giorni, holidays_list, input_root, selected_models, fast_mode),
+            args=(giorni, holidays_list, input_root, selected_models, fast_mode, auto_festivi, pulisci_anomalie, metodo_pulizia, usa_regressori, file_regressori),
             daemon=True,
         )
         self._worker_thread = thread
@@ -5031,7 +6677,7 @@ class ForecastGUI:
         self._start_buffer_sync()
         thread.start()
 
-    def _run_batch(self, giorni, holidays, input_root, modelli, fast_mode):
+    def _run_batch(self, giorni, holidays, input_root, modelli, fast_mode, auto_festivi=True, pulisci_anomalie=False, metodo_pulizia='interpolate', usa_regressori=False, file_regressori=''):
         buffer = io.StringIO()
         self._buffer_sync_ref = buffer
         # Duplica i log anche sullo stdout/stderr originale per visibilità da terminale
@@ -5061,11 +6707,26 @@ class ForecastGUI:
                 log_writer.write(f"Cartelle input: {', '.join(input_dirs)}\n")
                 log_writer.write(f"Modelli attivi: {', '.join(modelli)}\n")
                 log_writer.write(f"Profilo veloce (--fast): {'ON' if fast_mode else 'OFF'}\n")
+                log_writer.write(f"Correzione automatica festività: {'ON' if auto_festivi else 'OFF'}\n")
+                log_writer.write(f"Pulizia anomalie storico: {'ON (' + metodo_pulizia + ')' if pulisci_anomalie else 'OFF'}\n")
+                if usa_regressori and file_regressori:
+                    log_writer.write(f"Regressori esterni: ON (file: {os.path.basename(file_regressori)})\n")
                 if holidays:
                     log_writer.write(f"Festività escluse: {', '.join(holidays)}\n")
-                global FAST_MODE
+                global FAST_MODE, AUTO_FESTIVI, PULISCI_ANOMALIE, METODO_PULIZIA_ANOMALIE, _REGRESSORI_FILE_OVERRIDE
                 previous_fast = FAST_MODE
+                previous_auto_festivi = AUTO_FESTIVI
+                previous_pulisci = PULISCI_ANOMALIE
+                previous_metodo = METODO_PULIZIA_ANOMALIE
+                previous_regressori_file = getattr(sys.modules[__name__], '_REGRESSORI_FILE_OVERRIDE', None)
                 FAST_MODE = fast_mode
+                AUTO_FESTIVI = auto_festivi
+                PULISCI_ANOMALIE = pulisci_anomalie
+                METODO_PULIZIA_ANOMALIE = metodo_pulizia
+                if usa_regressori and file_regressori:
+                    _REGRESSORI_FILE_OVERRIDE = file_regressori
+                else:
+                    _REGRESSORI_FILE_OVERRIDE = None
                 try:
                     risultati = main(
                         giorni_forecast=giorni,
@@ -5075,6 +6736,10 @@ class ForecastGUI:
                     )
                 finally:
                     FAST_MODE = previous_fast
+                    AUTO_FESTIVI = previous_auto_festivi
+                    PULISCI_ANOMALIE = previous_pulisci
+                    METODO_PULIZIA_ANOMALIE = previous_metodo
+                    _REGRESSORI_FILE_OVERRIDE = previous_regressori_file
                 log_writer.write("\n>>> Elaborazione completata, preparo il riepilogo...\n")
 
                 # Conta successi
@@ -5561,12 +7226,84 @@ class ForecastGUI:
             self.interactive_ax.legend(loc='best')
 
         elif plot_type == "historical":
-            self.interactive_ax.text(0.5, 0.5, 'Serie storica non ancora implementata',
-                                   ha='center', va='center')
+            # Grafico Serie Storica - mostra l'andamento nel tempo
+            model_cols = [c for c in self.confronto_df.columns if c != 'DATA']
+            if model_cols:
+                # Usa il primo modello o una media
+                primary_model = model_cols[0]
+                dates = self.confronto_df['DATA']
+                values = self.confronto_df[primary_model]
+
+                # Plot principale
+                self.interactive_ax.fill_between(dates, values, alpha=0.3, color='#2E86AB')
+                self.interactive_ax.plot(dates, values, linewidth=2, color='#2E86AB', label=f'Forecast ({primary_model})')
+
+                # Media mobile a 7 giorni se ci sono abbastanza dati
+                if len(values) >= 7:
+                    ma7 = values.rolling(window=7, min_periods=1).mean()
+                    self.interactive_ax.plot(dates, ma7, linewidth=2, color='#F18F01',
+                                           linestyle='--', label='Media mobile 7gg')
+
+                self.interactive_ax.set_title('Serie Storica Forecast', fontsize=12, fontweight='bold')
+                self.interactive_ax.set_ylabel('Chiamate Previste')
+                self.interactive_ax.legend(loc='best')
+
+                # Evidenzia weekend
+                for i, date in enumerate(dates):
+                    if hasattr(date, 'dayofweek') and date.dayofweek >= 5:  # Sabato o Domenica
+                        self.interactive_ax.axvspan(date - pd.Timedelta(hours=12),
+                                                   date + pd.Timedelta(hours=12),
+                                                   alpha=0.1, color='gray')
 
         elif plot_type == "trend":
-            self.interactive_ax.text(0.5, 0.5, 'Analisi trend non ancora implementata',
-                                   ha='center', va='center')
+            # Grafico Analisi Trend - decomposizione semplificata
+            model_cols = [c for c in self.confronto_df.columns if c != 'DATA']
+            if model_cols:
+                primary_model = model_cols[0]
+                dates = self.confronto_df['DATA']
+                values = self.confronto_df[primary_model].values
+
+                # Trend lineare semplice
+                x = np.arange(len(values))
+                if len(values) > 1:
+                    z = np.polyfit(x, values, 1)
+                    trend_line = np.polyval(z, x)
+
+                    # Calcola residui (componente stagionale + rumore)
+                    residuals = values - trend_line
+
+                    # Subplot: originale + trend, residui
+                    self.interactive_ax.clear()
+                    self.interactive_fig.clear()
+
+                    ax1 = self.interactive_fig.add_subplot(211)
+                    ax1.plot(dates, values, linewidth=1.5, color='#2E86AB', label='Dati', alpha=0.7)
+                    ax1.plot(dates, trend_line, linewidth=2, color='#C73E1D', label='Trend lineare')
+                    ax1.set_title('Analisi Trend - Decomposizione', fontsize=12, fontweight='bold')
+                    ax1.set_ylabel('Chiamate')
+                    ax1.legend(loc='best')
+                    ax1.grid(True, alpha=0.3)
+
+                    # Pendenza trend
+                    slope = z[0]
+                    trend_dir = "crescente" if slope > 0 else "decrescente" if slope < 0 else "stabile"
+                    ax1.text(0.02, 0.98, f'Trend: {trend_dir} ({slope:+.1f}/giorno)',
+                            transform=ax1.transAxes, fontsize=9, verticalalignment='top',
+                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+                    ax2 = self.interactive_fig.add_subplot(212)
+                    ax2.bar(dates, residuals, color='#6A994E', alpha=0.6, width=0.8)
+                    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+                    ax2.set_ylabel('Residui')
+                    ax2.set_xlabel('Data')
+                    ax2.grid(True, alpha=0.3)
+
+                    self.interactive_ax = ax1  # Per compatibilità
+
+                    self.interactive_fig.autofmt_xdate()
+                    self.interactive_fig.tight_layout()
+                    self.interactive_canvas.draw()
+                    return  # Skip il codice comune alla fine
 
         self.interactive_ax.grid(True, alpha=0.3)
         self.interactive_fig.autofmt_xdate()
@@ -5857,6 +7594,8 @@ class ForecastGUI:
 
 if __name__ == "__main__":
     import argparse
+    import multiprocessing as mp
+    mp.freeze_support()
     parser = argparse.ArgumentParser(description='Analisi Traffico WFM')
     parser.add_argument('--input-dir', type=str, help='Cartella con file Excel di input', default=None)
     parser.add_argument('--fast', action='store_true', help='Modalità veloce')
@@ -5915,44 +7654,45 @@ if __name__ == "__main__":
     print("=" * 80)
 
     # =========================================================================
-    # *** PERSONALIZZA QUI IL PERIODO FORECAST ***
+    # *** CONFIGURAZIONE DA FILE JSON (forecast_config.json) ***
     # =========================================================================
-    GIORNI_FORECAST = 90  # <-- CAMBIA QUESTO VALORE!
-                          # Es: 7 = 1 settimana
-                          #     14 = 2 settimane
-                          #     28 = 4 settimane (default)
-                          #     60 = ~2 mesi
-                          #     90 = ~3 mesi
-
-    # =========================================================================
-    # *** PERSONALIZZA GESTIONE FESTIVITÀ (solo per Prophet) ***
-    # =========================================================================
-    # Se nel 2025 APRI il servizio in giorni che prima erano CHIUSI,
-    # escludi quelle festività dalla lista. Prophet imparerà dai dati storici
-    # che erano chiuse, ma se cambi policy devi escluderle manualmente.
-    #
-    # Esempio: Se nel 2024 eri chiuso a Natale (0 chiamate) ma nel 2025 apri:
-    # ESCLUDI_FESTIVITA = ['Natale', 'Santo_Stefano']
-    #
-    # Se mantieni le stesse policy dell'anno scorso, lascia vuoto:
-    ESCLUDI_FESTIVITA = []  # <-- Lista festività da escludere
-
-    # Festività disponibili:
-    # 'Capodanno', 'Epifania', 'Festa_Liberazione', 'Festa_Lavoro',
-    # 'Festa_Repubblica', 'Ferragosto', 'Ognissanti', 'Immacolata',
-    # 'Natale', 'Santo_Stefano', 'Capodanno_Vigilia', 'Pasqua',
-    # 'Venerdi_Santo', 'PostPasqua', 'Periodo_Natalizio', 'Post_Capodanno'
-    # E tutti i pre-festivi/post-festivi (es. 'Natale_PreFestivo')
+    # La configurazione viene caricata dal file forecast_config.json se presente.
+    # In alternativa, i valori di default vengono usati come fallback.
+    # Puoi anche usare variabili d'ambiente per override:
+    #   - FORECAST_GIORNI=90
+    #   - FORECAST_MODELLI=holtwinters,prophet,tbats
+    #   - FORECAST_FAST=1
+    #   - FORECAST_AUTO_FESTIVI=1
     # =========================================================================
 
-    # Se vuoi selezionare solo alcuni modelli da CLI (oltre alla GUI):
-    # Imposta la variabile d'ambiente FORECAST_MODELLI, es.:
-    #   FORECAST_MODELLI=holtwinters,prophet,tbats
-    # Se non impostata, verranno eseguiti tutti i modelli disponibili.
+    # Carica configurazione
+    config = _carica_config()
+
+    # Giorni forecast: priorità env var > config > default
+    env_giorni = os.environ.get("FORECAST_GIORNI")
+    if env_giorni:
+        try:
+            GIORNI_FORECAST = int(env_giorni)
+        except ValueError:
+            GIORNI_FORECAST = _get_config('forecast', 'giorni_forecast', 90)
+    else:
+        GIORNI_FORECAST = _get_config('forecast', 'giorni_forecast', 90)
+
+    # Festività da escludere: priorità config > default
+    ESCLUDI_FESTIVITA = _get_config('festivita', 'escludi', [])
+
+    # Auto correzione festività: priorità env var (già gestito globalmente) > config
+    if 'FORECAST_AUTO_FESTIVI' not in os.environ:
+        auto_fest_config = _get_config('festivita', 'auto_correzione', True)
+        if not auto_fest_config:
+            globals()['AUTO_FESTIVI'] = False
+
+    # Modelli da eseguire: priorità env var > config > default
     env_modelli = os.environ.get("FORECAST_MODELLI")
-    METODI_DA_ESEGUIRE = None
     if env_modelli:
         METODI_DA_ESEGUIRE = [m.strip() for m in env_modelli.split(',') if m.strip()]
+    else:
+        METODI_DA_ESEGUIRE = _get_config('modelli', 'abilitati', None)
     
     print(f"\n>>> FORECAST CONFIGURATO: {GIORNI_FORECAST} GIORNI <<<")
     print(f"    Equivalente a: {GIORNI_FORECAST/7:.1f} settimane")
@@ -5985,8 +7725,6 @@ if __name__ == "__main__":
     print("  GIORNI_FORECAST = 60  -> ~2 mesi")
     print("  GIORNI_FORECAST = 90  -> ~3 mesi")
     print("=" * 80 + "\n")
-
-
 
 
 
